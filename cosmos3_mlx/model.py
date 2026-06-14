@@ -351,19 +351,30 @@ class Cosmos3Model(nn.Module):
 
         # Build 3D mRoPE position IDs
         # Text tokens: all 3 axes share monotonically increasing IDs
-        text_pos = mx.arange(text_len)[None, :]  # [1, text_len]
+        # HF uses get_3d_mrope_ids_text_tokens which produces float positions
+        text_pos = mx.arange(text_len, dtype=mx.float32)[None, :]  # [1, text_len]
         text_position_ids = mx.stack([text_pos, text_pos, text_pos])  # [3, 1, text_len]
 
-        # Generation tokens: proper spatial grid positions
+        # Generation tokens: FPS-modulated temporal positions
+        # HF: scaled_t = frame_index / tps * base_tps + temporal_offset
+        # where tps = fps / temporal_compression_factor, base_tps = base_fps / base_tcf
         temporal_margin = 15000
-        temporal_offset = text_len + temporal_margin
-        t_idx = (mx.arange(grid_t) + temporal_offset).reshape(-1, 1)  # [T, 1]
-        t_idx = mx.broadcast_to(t_idx, (grid_t, grid_h * grid_w)).reshape(1, -1)
+        temporal_offset = float(text_len + temporal_margin)
 
-        h_idx = mx.arange(grid_h).reshape(1, -1, 1)
+        # Video FPS modulation: fps=25, temporal_compression_factor=4, base_fps=24
+        fps = 25.0
+        video_tcf = 4  # temporal compression factor for video VAE
+        base_fps = 24.0
+        tps = fps / video_tcf  # 6.25 tokens per second
+        base_tps = base_fps / video_tcf  # 6.0
+        frame_indices = mx.arange(grid_t, dtype=mx.float32)
+        scaled_t = frame_indices / tps * base_tps + temporal_offset
+        t_idx = mx.broadcast_to(scaled_t.reshape(-1, 1), (grid_t, grid_h * grid_w)).reshape(1, -1)
+
+        h_idx = mx.arange(grid_h, dtype=mx.float32).reshape(1, -1, 1)
         h_idx = mx.broadcast_to(h_idx, (grid_t, grid_h, grid_w)).reshape(1, -1)
 
-        w_idx = mx.arange(grid_w).reshape(1, 1, -1)
+        w_idx = mx.arange(grid_w, dtype=mx.float32).reshape(1, 1, -1)
         w_idx = mx.broadcast_to(w_idx, (grid_t, grid_h, grid_w)).reshape(1, -1)
 
         gen_position_ids = mx.stack([t_idx, h_idx, w_idx])  # [3, 1, num_patches]
@@ -378,10 +389,13 @@ class Cosmos3Model(nn.Module):
             audio_h = audio_h + mx.expand_dims(t_emb, 1)
 
             # Audio mRoPE: temporal siblings with video, grid_h=1, grid_w=1
-            # temporal_compression_factor=1 for audio (vs 4 for video)
-            audio_t_idx = (mx.arange(sound_len) + temporal_offset).reshape(1, -1)
-            audio_h_idx = mx.zeros((1, sound_len), dtype=mx.int32)
-            audio_w_idx = mx.zeros((1, sound_len), dtype=mx.int32)
+            # Audio: temporal_compression_factor=1, so tps = fps/1 = 25
+            audio_tps = fps / 1.0  # 25 tokens per second
+            audio_frame_indices = mx.arange(sound_len, dtype=mx.float32)
+            audio_scaled_t = audio_frame_indices / audio_tps * base_tps + temporal_offset
+            audio_t_idx = audio_scaled_t.reshape(1, -1)
+            audio_h_idx = mx.zeros((1, sound_len), dtype=mx.float32)
+            audio_w_idx = mx.zeros((1, sound_len), dtype=mx.float32)
             audio_position_ids = mx.stack([audio_t_idx, audio_h_idx, audio_w_idx])
 
             # Concatenate video + audio in generation pathway
