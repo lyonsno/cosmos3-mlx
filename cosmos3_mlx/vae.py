@@ -215,6 +215,10 @@ class WanDecoder(nn.Module):
     def _unpatchify(self, x: mx.array) -> mx.array:
         """Reverse spatial patchification: expand each spatial position.
 
+        HF packs channels as [C, p1, p2] and interleaves H with p2, W with p1.
+        In channels-last: reshape to [B, T, H, W, C, p1, p2], then permute so
+        p2 (dim6) interleaves with H and p1 (dim5) interleaves with W.
+
         Input: [B, T, H, W, C * p * p]
         Output: [B, T, H*p, W*p, C]
         """
@@ -222,7 +226,7 @@ class WanDecoder(nn.Module):
         p = self.config.patch_size
         c = self.config.out_channels
         x = x.reshape(b, t, h, w, c, p, p)
-        x = mx.transpose(x, (0, 1, 2, 5, 3, 6, 4))  # [B, T, H, p, W, p, C]
+        x = mx.transpose(x, (0, 1, 2, 6, 3, 5, 4))  # [B, T, H, p2, W, p1, C]
         x = x.reshape(b, t, h * p, w * p, c)
         return x
 

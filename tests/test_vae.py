@@ -132,6 +132,55 @@ class TestWanDecoder:
         assert not mx.any(mx.isnan(out)).item()
 
 
+class TestUnpatchify:
+    """Test unpatchify matches HF convention."""
+
+    def test_unpatchify_ordering_matches_hf(self):
+        """Unpatchify should interleave H with p2 and W with p1 (HF convention)."""
+        from cosmos3_mlx.vae import VAEConfig, WanDecoder
+
+        # Create known pattern: 12 channels = 3 * 2 * 2
+        # Channel values encode their index for verification
+        B, T, H, W, p, C = 1, 1, 2, 2, 2, 3
+        # Channels packed as [C, p1, p2]: ch0=C0p1_0p2_0, ch1=C0p1_0p2_1, etc.
+        x = mx.zeros((B, T, H, W, C * p * p))
+
+        # Set pixel (0,0) channels to known values
+        # After unpatchify, pixel layout should match HF:
+        # H-direction uses p2, W-direction uses p1
+        for c_idx in range(C):
+            for p1 in range(p):
+                for p2 in range(p):
+                    ch = c_idx * p * p + p1 * p + p2
+                    # Value encodes: 100*c + 10*p1 + p2
+                    val = 100 * c_idx + 10 * p1 + p2
+                    x = x.at[0, 0, 0, 0, ch].add(mx.array(float(val)))
+
+        mx.eval(x)
+
+        # Apply unpatchify
+        cfg = VAEConfig(out_channels=C, patch_size=p)
+        decoder = WanDecoder(cfg)
+        out = decoder._unpatchify(x)
+        mx.eval(out)
+
+        # Check pixel (0,0) in output: should be C0,p1=0,p2=0 -> value 0,0,0
+        # Pixel (0,1) in output (W+1): p1 increments -> value 0,10,0... wait
+        # Actually H interleaves p2, W interleaves p1
+        # out[0,0, h_base*p + p2_idx, w_base*p + p1_idx, c] = x[0,0, h_base, w_base, c*p*p + p1_idx*p + p2_idx]
+        # For h_base=0, w_base=0:
+        # out[0,0, 0, 0, 0] = x[..., 0*4 + 0*2 + 0] = val(c=0,p1=0,p2=0) = 0
+        # out[0,0, 1, 0, 0] = x[..., 0*4 + 0*2 + 1] = val(c=0,p1=0,p2=1) = 1
+        # out[0,0, 0, 1, 0] = x[..., 0*4 + 1*2 + 0] = val(c=0,p1=1,p2=0) = 10
+        # out[0,0, 1, 1, 0] = x[..., 0*4 + 1*2 + 1] = val(c=0,p1=1,p2=1) = 11
+        o = out[0, 0, :, :, 0]
+        mx.eval(o)
+        assert o[0, 0].item() == 0.0    # p1=0, p2=0
+        assert o[1, 0].item() == 1.0    # p2=1 (H direction)
+        assert o[0, 1].item() == 10.0   # p1=1 (W direction)
+        assert o[1, 1].item() == 11.0   # p1=1, p2=1
+
+
 class TestPostQuantConv:
     """Test post_quant_conv in the functional decoder."""
 

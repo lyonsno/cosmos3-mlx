@@ -395,22 +395,29 @@ def decode_latents(
         t_up = temporal_upsample[block_idx] if block_idx < len(temporal_upsample) else False
 
         if has_upsampler:
-            has_time_conv = f"{prefix}.upsampler.time_conv.weight" in weights
-            if has_time_conv and t_up:
-                x = _wan_resample_upsample3d(x, weights, f"{prefix}.upsampler")
-            else:
-                x = _wan_resample_upsample2d(x, weights, f"{prefix}.upsampler")
+            # HF WanResample: temporal upsampling (time_conv) only runs during
+            # cached/streaming inference (feat_cache is not None). For standard
+            # single-pass decode, always use spatial-only 2D upsample regardless
+            # of whether time_conv weights exist.
+            x = _wan_resample_upsample2d(x, weights, f"{prefix}.upsampler")
             mx.eval(x)
 
         # DupUp3D residual shortcut + add
         # DupUp3D has no learned weights — it's a pure channel-reshape operation.
         # Applied when the block has an upsampler (up_flag=True in HF).
+        # HF's _decode always calls with first_chunk=True for the first (and only
+        # in single-image mode) frame. DupUp3D with first_chunk=True applies the
+        # full factor_t temporal expansion then trims: x[:, factor_t-1:, ...].
         if is_residual and has_upsampler:
             in_c = x_copy.shape[-1]
             out_c = x.shape[-1]
+            t_up = temporal_upsample[block_idx] if block_idx < len(temporal_upsample) else False
             factor_t = 2 if t_up else 1
             factor_s = 2
             shortcut = _dup_up_3d_residual(x_copy, in_c, out_c, factor_t, factor_s)
+            # first_chunk trim: drop the first (factor_t - 1) temporal frames
+            if factor_t > 1:
+                shortcut = shortcut[:, factor_t - 1:, :, :, :]
             x = x + shortcut
             mx.eval(x)
 
@@ -424,12 +431,15 @@ def decode_latents(
     print(f"    After conv_out: {x.shape}")
 
     # Unpatchify if needed (patch_size=2)
+    # HF packs channels as [C, p1, p2] and interleaves H with p2, W with p1.
+    # In channels-last: reshape to [B, T, H, W, C, p1, p2], then permute so
+    # p2 (dim6) interleaves with H and p1 (dim5) interleaves with W.
     patch_size = config.get("patch_size", 2)
     if patch_size > 1:
         b, t, h, w, c_patch = x.shape
         c = c_patch // (patch_size * patch_size)
         x = x.reshape(b, t, h, w, c, patch_size, patch_size)
-        x = mx.transpose(x, (0, 1, 2, 5, 3, 6, 4))  # [B, T, H, p, W, p, C]
+        x = mx.transpose(x, (0, 1, 2, 6, 3, 5, 4))  # [B, T, H, p2, W, p1, C]
         x = x.reshape(b, t, h * patch_size, w * patch_size, c)
         print(f"    After unpatchify: {x.shape}")
 
