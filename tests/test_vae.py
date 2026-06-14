@@ -4,6 +4,9 @@ import mlx.core as mx
 import pytest
 
 from cosmos3_mlx.vae import VAEConfig, WanDecoder, WanResidualBlock, WanRMSNorm, dup_up_3d
+from cosmos3_mlx.decode_vae import (
+    _conv3d_forward, _transpose_conv3d_weight, decode_latents,
+)
 
 
 class TestVAEConfig:
@@ -127,3 +130,48 @@ class TestWanDecoder:
         out = small_decoder(z)
         mx.eval(out)
         assert not mx.any(mx.isnan(out)).item()
+
+
+class TestPostQuantConv:
+    """Test post_quant_conv in the functional decoder."""
+
+    def test_post_quant_conv_transforms_latents(self):
+        """post_quant_conv should be a non-trivial 1x1x1 channel transform."""
+        # Simulate a post_quant_conv weight: [O, I, 1, 1, 1] -> transposed [O, 1, 1, 1, I]
+        z_dim = 8
+        pqc_w_pt = mx.random.normal((z_dim, z_dim, 1, 1, 1)) * 0.1
+        pqc_w = _transpose_conv3d_weight(pqc_w_pt)
+        pqc_b = mx.zeros((z_dim,))
+
+        z = mx.random.normal((1, 1, 4, 4, z_dim))
+        mx.eval(z)
+
+        z_transformed = _conv3d_forward(z, pqc_w, pqc_b,
+                                        stride=(1, 1, 1), padding=(0, 0, 0), causal=False)
+        mx.eval(z_transformed)
+
+        # Shape preserved
+        assert z_transformed.shape == z.shape
+        # Not identity (random weights should change the values)
+        diff = mx.mean(mx.abs(z - z_transformed)).item()
+        assert diff > 0.01, f"post_quant_conv had no effect: diff={diff}"
+
+    def test_post_quant_conv_is_linear_channel_mix(self):
+        """1x1x1 conv should be equivalent to a linear transform on channels."""
+        z_dim = 4
+        # Create a known weight matrix
+        W = mx.array([[1, 0, 0, 0],
+                       [0, 0, 1, 0],
+                       [0, 1, 0, 0],
+                       [0, 0, 0, 1]], dtype=mx.float32)
+        # Shape as Conv3D weight: [O, I, 1, 1, 1]
+        w_pt = W.reshape(z_dim, z_dim, 1, 1, 1)
+        w_mlx = _transpose_conv3d_weight(w_pt)
+
+        z = mx.array([[[[[1.0, 2.0, 3.0, 4.0]]]]]) # [1, 1, 1, 1, 4]
+        out = _conv3d_forward(z, w_mlx, None,
+                              stride=(1,1,1), padding=(0,0,0), causal=False)
+        mx.eval(out)
+        # W swaps channels 1 and 2
+        expected = mx.array([[[[[1.0, 3.0, 2.0, 4.0]]]]])
+        assert mx.allclose(out, expected, atol=1e-5).item()

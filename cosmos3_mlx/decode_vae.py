@@ -295,9 +295,19 @@ def decode_latents(
     # Load weights
     raw_weights = mx.load(str(vae_path / "diffusion_pytorch_model.safetensors"))
 
-    # Extract decoder weights, transpose Conv3D and Conv2D
+    # Extract decoder weights and post_quant_conv, transpose Conv3D and Conv2D
     weights = {}
+    pqc_weight = None
+    pqc_bias = None
     for k, v in raw_weights.items():
+        if k == "post_quant_conv.weight":
+            # [O, I, 1, 1, 1] -> [O, 1, 1, 1, I] for Conv3D, but since kernel=1
+            # it's effectively a linear transform on channels
+            pqc_weight = _transpose_conv3d_weight(v).astype(mx.bfloat16)
+            continue
+        if k == "post_quant_conv.bias":
+            pqc_bias = v.astype(mx.bfloat16)
+            continue
         if not k.startswith("decoder."):
             continue
         name = k[len("decoder."):]
@@ -322,6 +332,13 @@ def decode_latents(
     z = latents * std + mean
 
     print(f"    Denormalized latent stats: mean={mx.mean(z).item():.3f}, std={mx.std(z).item():.3f}")
+
+    # post_quant_conv: 1x1x1 Conv3D that transforms latent channels before decoder
+    if pqc_weight is not None:
+        z = _conv3d_forward(z, pqc_weight, pqc_bias,
+                            stride=(1, 1, 1), padding=(0, 0, 0), causal=False)
+        mx.eval(z)
+        print(f"    After post_quant_conv: mean={mx.mean(z).item():.3f}, std={mx.std(z).item():.3f}")
 
     # conv_in
     x = _conv3d_forward(z, weights["conv_in.weight"], weights.get("conv_in.bias"))
