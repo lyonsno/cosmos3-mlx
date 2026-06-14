@@ -296,8 +296,9 @@ class VisionModel(nn.Module):
     def _compute_3d_rotary_pos_emb(self, grid_thw: mx.array) -> tuple[mx.array, mx.array]:
         """Compute 3D-aware rotary position embeddings from grid dimensions.
 
-        Each patch gets position IDs based on its (temporal, height, width) location,
-        not just a flat sequence index. This encodes spatial relationships correctly.
+        Each patch gets position IDs based on its (temporal, height, width) location.
+        Following Qwen3-VL: each axis uses the full inv_freq vector independently,
+        and the results are concatenated to produce [n_patches, head_dim].
 
         Args:
             grid_thw: [batch, 3] with (temporal, height, width) grid dims
@@ -321,26 +322,24 @@ class VisionModel(nn.Module):
             h_ids = mx.arange(h, dtype=mx.float32)
             w_ids = mx.arange(w, dtype=mx.float32)
 
-            # Meshgrid: each patch gets (t, h, w) coordinates
             # Flatten to [t*h*w] position IDs for each axis
             pos_t = mx.repeat(t_ids, h * w)  # [t*h*w]
             pos_h = mx.tile(mx.repeat(h_ids, w), t)  # [t*h*w]
             pos_w = mx.tile(w_ids, t * h)  # [t*h*w]
 
-            # Combine: use height and width for the rotary embeddings
-            # (following Qwen3-VL which uses h and w positions interleaved)
-            # Split inv_freq in half for height and width
-            half = half_dim // 2
-            inv_freq_h = inv_freq[:half]
-            inv_freq_w = inv_freq[half:]
+            # Each axis uses the full inv_freq vector independently
+            # then concatenate: [freqs_h, freqs_w] -> [n_patches, head_dim]
+            # For head_dim=72 (1152/16): half_dim=36, each axis produces [n_patches, 36]
+            # Concatenating h+w gives [n_patches, 72] = [n_patches, head_dim]
+            #
+            # For video (t>1), temporal is encoded via pos_h/pos_w varying per frame
+            # (the pos_t offset is implicit in the meshgrid layout).
+            # Following Qwen3-VL: use spatial (h, w) as the two axes for 2D RoPE.
+            freqs_h = mx.outer(pos_h, inv_freq)  # [n_patches, half_dim]
+            freqs_w = mx.outer(pos_w, inv_freq)  # [n_patches, half_dim]
 
-            # Compute frequencies for each axis
-            freqs_h = mx.outer(pos_h, inv_freq_h)  # [n_patches, half_dim//2]
-            freqs_w = mx.outer(pos_w, inv_freq_w)  # [n_patches, half_dim//2]
-
-            # Concatenate h and w frequencies
-            freqs = mx.concatenate([freqs_h, freqs_w], axis=-1)  # [n_patches, half_dim]
-            emb = mx.concatenate([freqs, freqs], axis=-1)  # [n_patches, head_dim]
+            # Concatenate to head_dim: [n_patches, half_dim * 2] = [n_patches, head_dim]
+            emb = mx.concatenate([freqs_h, freqs_w], axis=-1)
 
             all_cos.append(mx.cos(emb))
             all_sin.append(mx.sin(emb))

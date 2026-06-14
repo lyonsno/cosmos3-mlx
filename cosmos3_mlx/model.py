@@ -223,9 +223,10 @@ class Cosmos3Model(nn.Module):
 
             tokens.append(next_token)
 
-            # Check EOS
-            if eos_token_id is not None and next_token.item() == eos_token_id:
-                break
+            # Check EOS (batch=1 only)
+            if eos_token_id is not None and next_token.shape[0] == 1:
+                if next_token[0, 0].item() == eos_token_id:
+                    break
 
             # Forward single token with cache
             logits, caches = self.__call__(next_token, cache=caches)

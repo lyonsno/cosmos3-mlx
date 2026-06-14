@@ -69,12 +69,12 @@ class Cosmos3RotaryEmbedding(nn.Module):
         sin_parts = []
 
         for axis_idx, section_dim in enumerate(self.mrope_section):
-            inv_freq = self._compute_inv_freq(section_dim)  # [section_dim // 2]
+            inv_freq = self._compute_inv_freq(section_dim)  # [section_dim]
 
             # position_ids for this axis: [batch, seq_len]
             pos = position_ids[axis_idx].astype(mx.float32)  # [batch, seq_len]
 
-            # Outer product: [batch, seq_len, section_dim // 2]
+            # Outer product: [batch, seq_len, section_dim]
             freqs = mx.expand_dims(pos, -1) * mx.expand_dims(
                 mx.expand_dims(inv_freq, 0), 0
             )
