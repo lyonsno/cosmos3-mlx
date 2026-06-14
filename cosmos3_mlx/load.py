@@ -170,7 +170,14 @@ def load_tokenizer(model_dir: str | Path):
     from transformers import AutoTokenizer
 
     model_dir = Path(model_dir)
+
+    # Try text_tokenizer subdirectory first (HF Cosmos3 layout),
+    # then fall back to root directory
+    tokenizer_dir = model_dir / "text_tokenizer"
+    if not tokenizer_dir.exists():
+        tokenizer_dir = model_dir
+
     return AutoTokenizer.from_pretrained(
-        str(model_dir),
+        str(tokenizer_dir),
         trust_remote_code=False,
     )
