@@ -13,6 +13,7 @@ dependencies = [
     "tokenizers",
     "transformers",
     "pillow",
+    "jinja2",
 ]
 
 [project.optional-dependencies]

@@ -137,11 +137,31 @@ class Cosmos3Model(nn.Module):
             Cosmos3DecoderLayer(config) for _ in range(config.num_hidden_layers)
         ]
 
-        # Final norm
+        # Final norms (understanding + generation)
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm_moe_gen = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # LM head (tied with embeddings in the reference, but separate here)
+        # LM head
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Generation pathway: latent projections
+        # patch_latent_dim = z_dim(48) * patch_size(2) * patch_size(2) = 192
+        patch_latent_dim = 192
+        self.proj_in = nn.Linear(patch_latent_dim, config.hidden_size, bias=True)
+        self.proj_out = nn.Linear(config.hidden_size, patch_latent_dim, bias=True)
+
+        # Audio projections
+        sound_dim = 64
+        self.audio_proj_in = nn.Linear(sound_dim, config.hidden_size, bias=True)
+        self.audio_proj_out = nn.Linear(config.hidden_size, sound_dim, bias=True)
+
+        # Timestep embedder
+        from .timestep import TimestepEmbedding
+        self.time_embedder = TimestepEmbedding(config.hidden_size)
+
+        # Modality embeddings
+        self.audio_modality_embed = mx.zeros((config.hidden_size,))
+        self.action_modality_embed = mx.zeros((config.hidden_size,))
 
     def __call__(
         self,

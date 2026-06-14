@@ -99,8 +99,9 @@ def load_transformer(
     # Cast to target dtype
     weights = {k: v.astype(dtype) for k, v in weights.items()}
 
-    # Load into model
-    model.load_weights(list(weights.items()))
+    # Load into model (strict=False to skip weights not in model,
+    # e.g. action_proj_in.fc which uses a non-standard structure)
+    model.load_weights(list(weights.items()), strict=False)
 
     return model
 
