@@ -172,36 +172,36 @@ class Cosmos3GenerationPipeline:
         print(f"  Denoising steps: {num_inference_steps}")
 
         # 4. Denoising loop
-        for i, t in enumerate(self.scheduler.timesteps.tolist()):
+        timestep_list = self.scheduler.timesteps.tolist()
+        for i, t in enumerate(timestep_list):
             t_val = float(t)
 
             # Patchify current latents
             gen_tokens = self._patchify_latents(latents).astype(dtype)
 
-            # Get text embeddings from understanding path
-            text_embeds = self.model.embed_tokens(cond_ids)
-            und_len = text_embeds.shape[1]
+            # Timestep tensor
+            t_tensor = mx.array([t_val]).astype(dtype)
 
-            # Build position IDs for full sequence [text + gen tokens]
-            total_len = und_len + num_patches
-            pos = mx.arange(total_len)[None, :]
-            position_ids = mx.stack([pos, pos, pos])
+            # Conditional forward: get velocity prediction
+            cond_velocity = self.model.diffusion_forward(
+                cond_ids, gen_tokens, t_tensor
+            )
 
-            # Forward through transformer layers with both pathways
-            h = text_embeds
-            gen_h = self.model.embed_tokens(
-                mx.zeros((1, num_patches), dtype=mx.int32)
-            )  # Placeholder — generation tokens don't use text embeddings
+            # Classifier-free guidance
+            if guidance_scale != 1.0:
+                uncond_velocity = self.model.diffusion_forward(
+                    uncond_ids, gen_tokens, t_tensor
+                )
+                velocity_patches = uncond_velocity + guidance_scale * (
+                    cond_velocity - uncond_velocity
+                )
+            else:
+                velocity_patches = cond_velocity
 
-            # For now, use a simplified generation forward:
-            # Feed the generation tokens through the transformer using the
-            # generation pathway attention
-            # TODO: Full dual-pathway forward with proper gen token injection
-
-            # Simplified: run text through understanding path to get KV context,
-            # then we'd need the gen path. For now, output noise prediction as zero
-            # (this is scaffolding — real inference needs the full gen path wiring)
-            velocity = mx.zeros_like(latents)
+            # Unpatchify velocity back to latent shape
+            velocity = self._unpatchify_latents(
+                velocity_patches, t_lat, h_p, w_p
+            )
 
             # Scheduler step
             next_t = (

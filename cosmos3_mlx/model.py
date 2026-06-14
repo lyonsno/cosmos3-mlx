@@ -118,6 +118,54 @@ class Cosmos3DecoderLayer(nn.Module):
 
         return hidden_states, new_cache
 
+    def forward_with_generation(
+        self,
+        und_hidden: mx.array,
+        gen_hidden: mx.array,
+        position_ids: mx.array,
+    ) -> Tuple[mx.array, mx.array]:
+        """Forward pass with both understanding and generation pathways.
+
+        Args:
+            und_hidden: [batch, und_len, hidden_size] understanding tokens
+            gen_hidden: [batch, gen_len, hidden_size] generation tokens
+            position_ids: [3, batch, und_len + gen_len]
+
+        Returns:
+            (und_output, gen_output)
+        """
+        # Understanding pre-norm
+        und_residual = und_hidden
+        und_normed = self.input_layernorm(und_hidden)
+
+        # Generation pre-norm
+        gen_residual = gen_hidden
+        gen_normed = self.input_layernorm_moe_gen(gen_hidden)
+
+        # Dual-pathway attention
+        und_attn, gen_attn, _ = self.self_attn(
+            hidden_states=und_normed,
+            position_ids=position_ids,
+            understanding_mask=None,
+            generation_tokens=gen_normed,
+        )
+
+        # Understanding residual + MLP
+        und_hidden = und_residual + und_attn
+        und_residual = und_hidden
+        und_hidden = self.post_attention_layernorm(und_hidden)
+        und_hidden = self.mlp(und_hidden)
+        und_hidden = und_residual + und_hidden
+
+        # Generation residual + MLP
+        gen_hidden = gen_residual + gen_attn
+        gen_residual = gen_hidden
+        gen_hidden = self.post_attention_layernorm_moe_gen(gen_hidden)
+        gen_hidden = self.mlp_moe_gen(gen_hidden)
+        gen_hidden = gen_residual + gen_hidden
+
+        return und_hidden, gen_hidden
+
 
 class Cosmos3Model(nn.Module):
     """Cosmos 3 Mixture-of-Transformers model.
@@ -145,10 +193,10 @@ class Cosmos3Model(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Generation pathway: latent projections
-        # patch_latent_dim = z_dim(48) * patch_size(2) * patch_size(2) = 192
-        patch_latent_dim = 192
-        self.proj_in = nn.Linear(patch_latent_dim, config.hidden_size, bias=True)
-        self.proj_out = nn.Linear(config.hidden_size, patch_latent_dim, bias=True)
+        # patch_latent_dim = latent_channel(48) * latent_patch_size(2)^2 = 192
+        # These are loaded from weights; default matches Cosmos3-Nano
+        self.proj_in = nn.Linear(192, config.hidden_size, bias=True)
+        self.proj_out = nn.Linear(config.hidden_size, 192, bias=True)
 
         # Audio projections
         sound_dim = 64
@@ -253,3 +301,56 @@ class Cosmos3Model(nn.Module):
             mx.eval(logits, *[c for cache_pair in caches for c in cache_pair])
 
         return mx.concatenate(tokens, axis=1)
+
+    def diffusion_forward(
+        self,
+        input_ids: mx.array,
+        gen_tokens: mx.array,
+        timestep: mx.array,
+    ) -> mx.array:
+        """Forward pass for diffusion generation (one denoising step).
+
+        Runs both understanding (text) and generation (latent) pathways
+        through the dual-pathway MoT transformer. Returns velocity prediction
+        for the generation tokens.
+
+        Args:
+            input_ids: [batch, text_len] text token IDs
+            gen_tokens: [batch, num_patches, patch_latent_dim] patchified latents
+            timestep: [batch] current diffusion timestep
+
+        Returns:
+            [batch, num_patches, patch_latent_dim] velocity prediction
+        """
+        batch = input_ids.shape[0]
+        text_len = input_ids.shape[1]
+        num_patches = gen_tokens.shape[1]
+
+        # Embed text tokens
+        und_h = self.embed_tokens(input_ids)
+
+        # Project generation tokens into hidden space
+        gen_h = self.proj_in(gen_tokens)
+
+        # Add timestep embedding to generation tokens
+        t_emb = self.time_embedder(timestep)  # [batch, hidden_size]
+        gen_h = gen_h + mx.expand_dims(t_emb, 1)
+
+        # Build position IDs for full sequence
+        total_len = text_len + num_patches
+        pos = mx.arange(total_len)[None, :]
+        position_ids = mx.stack([pos, pos, pos])  # [3, 1, total_len]
+
+        # Forward through all layers with both pathways
+        for layer in self.layers:
+            und_h, gen_h = layer.forward_with_generation(
+                und_h, gen_h, position_ids
+            )
+
+        # Apply generation final norm
+        gen_h = self.norm_moe_gen(gen_h)
+
+        # Project back to patch latent space
+        velocity = self.proj_out(gen_h)
+
+        return velocity

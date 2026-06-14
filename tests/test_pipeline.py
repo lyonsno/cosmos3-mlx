@@ -1,6 +1,7 @@
 """Tests for the generation pipeline."""
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 from cosmos3_mlx.model import Cosmos3Config, Cosmos3Model
@@ -37,6 +38,9 @@ class TestGenerationPipeline:
             mrope_section=[6, 5, 5],
         )
         model = Cosmos3Model(cfg)
+        # Override proj_in/out to match test VAE dims (z_dim=8, patch=2 → 32)
+        model.proj_in = nn.Linear(32, 128, bias=True)
+        model.proj_out = nn.Linear(128, 32, bias=True)
 
         vae_cfg = VAEConfig(
             z_dim=8,
