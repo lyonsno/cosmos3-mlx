@@ -1,14 +1,15 @@
 """3D Multi-dimensional Rotary Position Embeddings for Cosmos 3.
 
 Cosmos 3 uses interleaved mRoPE with three axes (temporal, height, width)
-following the Qwen3-VL design. Each axis gets a section of the head dimensions:
-  - temporal: mrope_section[0] dims (default 24)
-  - height:   mrope_section[1] dims (default 20)
-  - width:    mrope_section[2] dims (default 20)
-Total = 64 half-dims = 128 head_dim / 2.
+following the Qwen3-VL design. All axes share a single set of inverse
+frequencies. Position IDs from different axes are interleaved before
+frequency computation:
+  - temporal positions go to indices {0, 3, 6, ...}
+  - height positions go to indices {1, 4, 7, ...}
+  - width positions go to indices {2, 5, 8, ...}
 
-The interleaved layout mixes [T, H, W] frequencies so that adjacent
-dimensions alternate axes, preserving frequency continuity.
+The mrope_section [24, 20, 20] determines how many frequency dimensions
+are assigned to each axis. Total = 64 half-dims = 128 head_dim / 2.
 """
 
 import math
@@ -19,7 +20,12 @@ import mlx.nn as nn
 
 
 class Cosmos3RotaryEmbedding(nn.Module):
-    """Compute 3D interleaved mRoPE cos/sin embeddings."""
+    """Compute 3D interleaved mRoPE cos/sin embeddings.
+
+    Matches HuggingFace Cosmos3VLTextRotaryEmbedding:
+    - Single shared inv_freq for all axes
+    - Interleaved axis layout (T,H,W at strides of 3)
+    """
 
     def __init__(
         self,
@@ -32,22 +38,15 @@ class Cosmos3RotaryEmbedding(nn.Module):
         self.mrope_section = mrope_section or [24, 20, 20]
         self.rope_theta = rope_theta
 
-        # Validate: sections must sum to head_dim // 2
         half_dim = head_dim // 2
         assert sum(self.mrope_section) == half_dim, (
             f"mrope_section {self.mrope_section} sums to {sum(self.mrope_section)}, "
             f"expected {half_dim}"
         )
 
-    def _compute_inv_freq(self, section_dim: int) -> mx.array:
-        """Compute inverse frequency bands for a section.
-
-        section_dim is already in half-dim space (e.g. 24 out of 64 total).
-        We produce section_dim frequencies.
-        """
-        freqs = mx.arange(0, section_dim, dtype=mx.float32) / section_dim
-        inv_freq = 1.0 / (self.rope_theta ** freqs)
-        return inv_freq
+        # Single shared inv_freq for all axes (matching HF reference)
+        inv_freq = 1.0 / (rope_theta ** (mx.arange(0, head_dim, 2, dtype=mx.float32) / head_dim))
+        self._inv_freq = inv_freq  # [half_dim = 64]
 
     def __call__(
         self,
@@ -64,29 +63,53 @@ class Cosmos3RotaryEmbedding(nn.Module):
             cos: [batch, seq_len, head_dim]
             sin: [batch, seq_len, head_dim]
         """
-        # Compute per-axis frequencies and combine
-        cos_parts = []
-        sin_parts = []
+        half_dim = self.head_dim // 2  # 64
 
-        for axis_idx, section_dim in enumerate(self.mrope_section):
-            inv_freq = self._compute_inv_freq(section_dim)  # [section_dim]
-
-            # position_ids for this axis: [batch, seq_len]
+        # Compute freqs for each axis: pos[axis] @ inv_freq
+        # Each axis gets [batch, seq_len, half_dim] frequencies
+        # freqs shape: [3, batch, seq_len, half_dim]
+        freqs_per_axis = []
+        for axis_idx in range(3):
             pos = position_ids[axis_idx].astype(mx.float32)  # [batch, seq_len]
+            # Outer product: [batch, seq_len, 1] * [1, 1, half_dim]
+            f = mx.expand_dims(pos, -1) * mx.expand_dims(
+                mx.expand_dims(self._inv_freq, 0), 0
+            )  # [batch, seq_len, half_dim]
+            freqs_per_axis.append(f)
 
-            # Outer product: [batch, seq_len, section_dim]
-            freqs = mx.expand_dims(pos, -1) * mx.expand_dims(
-                mx.expand_dims(inv_freq, 0), 0
-            )
+        # Interleave axes into a single frequency tensor
+        # HF reference: temporal at {0,3,6,...}, height at {1,4,7,...}, width at {2,5,8,...}
+        #
+        # Build a mapping: for each output dim, which axis provides its value
+        # All three axes computed the same 64 frequencies (shared inv_freq),
+        # so we just need to pick which axis's position-scaled result goes where.
+        #
+        # Start with temporal everywhere, then overwrite H and W at stride-3
+        # This matches HF's apply_interleaved_mrope
+        axis_assignment = [0] * half_dim  # default: temporal
+        for dim_offset, axis_idx in enumerate([1, 2], start=1):
+            section_len = self.mrope_section[axis_idx]
+            total_interleaved = section_len * 3
+            for freq_idx in range(dim_offset, min(total_interleaved, half_dim), 3):
+                axis_assignment[freq_idx] = axis_idx
 
-            cos_parts.append(mx.cos(freqs))
-            sin_parts.append(mx.sin(freqs))
+        # Gather from the appropriate axis for each frequency dimension
+        # Stack all axes: [3, batch, seq_len, half_dim]
+        all_freqs = mx.stack(freqs_per_axis)  # [3, B, N, 64]
+        # Select per-dim: use axis_assignment to index into axis dimension
+        axis_indices = mx.array(axis_assignment)  # [half_dim]
+        # Gather: for each dim d, take all_freqs[axis_assignment[d], :, :, d]
+        freqs_parts = []
+        for d in range(half_dim):
+            a = axis_assignment[d]
+            freqs_parts.append(freqs_per_axis[a][..., d:d+1])
+        freqs = mx.concatenate(freqs_parts, axis=-1)  # [batch, seq_len, half_dim]
 
-        # Concatenate sections: [batch, seq_len, half_dim]
-        cos_cat = mx.concatenate(cos_parts, axis=-1)
-        sin_cat = mx.concatenate(sin_parts, axis=-1)
+        # Double-up: [cos(f), cos(f)] and [sin(f), sin(f)] for full head_dim
+        cos = mx.cos(freqs)
+        sin = mx.sin(freqs)
 
-        return cos_cat, sin_cat
+        return cos, sin
 
 
 def rotate_half(x: mx.array) -> mx.array:
@@ -108,14 +131,13 @@ def apply_rotary_pos_emb(
     Args:
         q: [batch, seq_len, num_heads, head_dim]
         k: [batch, seq_len, num_kv_heads, head_dim]
-        cos: [batch, seq_len, head_dim]
-        sin: [batch, seq_len, head_dim]
+        cos: [batch, seq_len, half_dim]
+        sin: [batch, seq_len, half_dim]
 
     Returns:
         q_rotated, k_rotated with same shapes as inputs
     """
-    # cos/sin are [batch, seq_len, half_dim]
-    # Duplicate to match full head_dim: [cos, cos] for the two halves
+    # Duplicate cos/sin to match full head_dim: [cos, cos] for the two halves
     cos_full = mx.concatenate([cos, cos], axis=-1)  # [batch, seq_len, head_dim]
     sin_full = mx.concatenate([sin, sin], axis=-1)  # [batch, seq_len, head_dim]
 
