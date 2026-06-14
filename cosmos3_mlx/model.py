@@ -310,12 +310,13 @@ class Cosmos3Model(nn.Module):
         grid_t: int = 1,
         grid_h: int = 1,
         grid_w: int = 1,
-    ) -> mx.array:
+        audio_tokens: Optional[mx.array] = None,
+    ) -> mx.array | tuple[mx.array, mx.array]:
         """Forward pass for diffusion generation (one denoising step).
 
         Runs both understanding (text) and generation (latent) pathways
         through the dual-pathway MoT transformer. Returns velocity prediction
-        for the generation tokens.
+        for the generation tokens, and optionally for audio tokens.
 
         Args:
             input_ids: [batch, text_len] text token IDs
@@ -324,9 +325,13 @@ class Cosmos3Model(nn.Module):
             grid_t: temporal grid size (number of latent frames)
             grid_h: height grid size (latent height / patch_size)
             grid_w: width grid size (latent width / patch_size)
+            audio_tokens: optional [batch, sound_len, sound_dim] audio latents
 
         Returns:
-            [batch, num_patches, patch_latent_dim] velocity prediction
+            If audio_tokens is None:
+                [batch, num_patches, patch_latent_dim] velocity prediction
+            If audio_tokens is provided:
+                (vision_velocity, audio_velocity) tuple
         """
         batch = input_ids.shape[0]
         text_len = input_ids.shape[1]
@@ -350,22 +355,38 @@ class Cosmos3Model(nn.Module):
         text_position_ids = mx.stack([text_pos, text_pos, text_pos])  # [3, 1, text_len]
 
         # Generation tokens: proper spatial grid positions
-        # Temporal axis: frame index with large modality margin from text
-        # Reference uses unified_3d_mrope_temporal_modality_margin=15000
-        # so gen tokens start at text_len + 15000 in the temporal axis
-        # Height/Width axes: reset to 0 (spatial grid within each frame)
         temporal_margin = 15000
         temporal_offset = text_len + temporal_margin
         t_idx = (mx.arange(grid_t) + temporal_offset).reshape(-1, 1)  # [T, 1]
-        t_idx = mx.broadcast_to(t_idx, (grid_t, grid_h * grid_w)).reshape(1, -1)  # [1, T*H*W]
+        t_idx = mx.broadcast_to(t_idx, (grid_t, grid_h * grid_w)).reshape(1, -1)
 
-        h_idx = mx.arange(grid_h).reshape(1, -1, 1)  # [1, H, 1]
-        h_idx = mx.broadcast_to(h_idx, (grid_t, grid_h, grid_w)).reshape(1, -1)  # [1, T*H*W]
+        h_idx = mx.arange(grid_h).reshape(1, -1, 1)
+        h_idx = mx.broadcast_to(h_idx, (grid_t, grid_h, grid_w)).reshape(1, -1)
 
-        w_idx = mx.arange(grid_w).reshape(1, 1, -1)  # [1, 1, W]
-        w_idx = mx.broadcast_to(w_idx, (grid_t, grid_h, grid_w)).reshape(1, -1)  # [1, T*H*W]
+        w_idx = mx.arange(grid_w).reshape(1, 1, -1)
+        w_idx = mx.broadcast_to(w_idx, (grid_t, grid_h, grid_w)).reshape(1, -1)
 
         gen_position_ids = mx.stack([t_idx, h_idx, w_idx])  # [3, 1, num_patches]
+
+        # Handle audio tokens
+        if audio_tokens is not None:
+            sound_len = audio_tokens.shape[1]
+
+            # Project audio tokens + add modality embedding + timestep
+            audio_h = self.audio_proj_in(audio_tokens)
+            audio_h = audio_h + self.audio_modality_embed
+            audio_h = audio_h + mx.expand_dims(t_emb, 1)
+
+            # Audio mRoPE: temporal siblings with video, grid_h=1, grid_w=1
+            # temporal_compression_factor=1 for audio (vs 4 for video)
+            audio_t_idx = (mx.arange(sound_len) + temporal_offset).reshape(1, -1)
+            audio_h_idx = mx.zeros((1, sound_len), dtype=mx.int32)
+            audio_w_idx = mx.zeros((1, sound_len), dtype=mx.int32)
+            audio_position_ids = mx.stack([audio_t_idx, audio_h_idx, audio_w_idx])
+
+            # Concatenate video + audio in generation pathway
+            gen_h = mx.concatenate([gen_h, audio_h], axis=1)
+            gen_position_ids = mx.concatenate([gen_position_ids, audio_position_ids], axis=2)
 
         # Concatenate text + generation position IDs
         position_ids = mx.concatenate([text_position_ids, gen_position_ids], axis=2)
@@ -379,7 +400,13 @@ class Cosmos3Model(nn.Module):
         # Apply generation final norm
         gen_h = self.norm_moe_gen(gen_h)
 
-        # Project back to patch latent space
-        velocity = self.proj_out(gen_h)
-
-        return velocity
+        # Split and project back
+        if audio_tokens is not None:
+            vision_h = gen_h[:, :num_patches, :]
+            audio_h = gen_h[:, num_patches:, :]
+            vision_velocity = self.proj_out(vision_h)
+            audio_velocity = self.audio_proj_out(audio_h)
+            return vision_velocity, audio_velocity
+        else:
+            velocity = self.proj_out(gen_h)
+            return velocity

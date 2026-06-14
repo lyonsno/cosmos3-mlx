@@ -115,8 +115,9 @@ class Cosmos3GenerationPipeline:
         num_inference_steps: int = 30,
         guidance_scale: float = 6.0,
         seed: Optional[int] = None,
+        enable_audio: bool = False,
     ) -> dict:
-        """Generate image/video from text prompt.
+        """Generate image/video from text prompt, optionally with audio.
 
         Args:
             prompt: text description
@@ -126,9 +127,11 @@ class Cosmos3GenerationPipeline:
             num_inference_steps: denoising steps
             guidance_scale: classifier-free guidance strength
             seed: random seed for reproducibility
+            enable_audio: whether to generate audio alongside video
 
         Returns:
-            dict with 'latents', 'video' (if VAE available), 'audio' (if enabled)
+            dict with 'latents', 'video' (if VAE available),
+            'audio_latents' (if enable_audio), 'audio' (if audio decoded)
         """
         if seed is not None:
             mx.random.seed(seed)
@@ -181,8 +184,25 @@ class Cosmos3GenerationPipeline:
         w_p = w_lat // p
         num_patches = t_lat * h_p * w_p
 
-        # 3. Set up scheduler
+        # 2b. Prepare audio noise latents if enabled
+        sound_latents = None
+        sound_len = 0
+        if enable_audio and num_frames > 1:
+            sound_dim = 64  # Cosmos3 audio latent dim
+            sampling_rate = 48000
+            fps = 25
+            hop_size = 1920
+            n_audio_samples = int(num_frames / fps * sampling_rate)
+            sound_len = (n_audio_samples + hop_size - 1) // hop_size
+            sound_latents = mx.random.normal((1, sound_len, sound_dim)).astype(dtype)
+            print(f"  Audio latents: {sound_len} frames ({n_audio_samples} samples @ {sampling_rate}Hz)")
+
+        # 3. Set up schedulers
         self.scheduler.set_timesteps(num_inference_steps)
+        if sound_latents is not None:
+            from copy import deepcopy
+            audio_scheduler = UniPCScheduler()
+            audio_scheduler.set_timesteps(num_inference_steps)
 
         print(f"  Latent shape: ({t_lat}, {h_lat}, {w_lat}, {z_dim})")
         print(f"  Patches: {num_patches} ({t_lat}×{h_p}×{w_p})")
@@ -198,26 +218,49 @@ class Cosmos3GenerationPipeline:
             # Timestep tensor (sigma * num_train_timesteps)
             t_tensor = mx.array([sigma * self.scheduler.num_train_timesteps]).astype(dtype)
 
+            # Audio tokens for this step
+            audio_tokens = sound_latents if sound_latents is not None else None
+
             # Conditional forward: get velocity prediction
-            cond_velocity = self.model.diffusion_forward(
+            cond_result = self.model.diffusion_forward(
                 cond_ids, gen_tokens, t_tensor,
                 grid_t=t_lat, grid_h=h_p, grid_w=w_p,
+                audio_tokens=audio_tokens,
             )
 
             # Classifier-free guidance
             if guidance_scale != 1.0:
-                # Eval conditional velocity first to free its computation graph
-                # before building the unconditional graph (halves peak memory)
-                mx.eval(cond_velocity)
-                uncond_velocity = self.model.diffusion_forward(
+                if audio_tokens is not None:
+                    cond_velocity, cond_audio_vel = cond_result
+                    mx.eval(cond_velocity, cond_audio_vel)
+                else:
+                    cond_velocity = cond_result
+                    mx.eval(cond_velocity)
+
+                uncond_result = self.model.diffusion_forward(
                     uncond_ids, gen_tokens, t_tensor,
                     grid_t=t_lat, grid_h=h_p, grid_w=w_p,
+                    audio_tokens=audio_tokens,
                 )
-                velocity_patches = uncond_velocity + guidance_scale * (
-                    cond_velocity - uncond_velocity
-                )
+
+                if audio_tokens is not None:
+                    uncond_velocity, uncond_audio_vel = uncond_result
+                    velocity_patches = uncond_velocity + guidance_scale * (
+                        cond_velocity - uncond_velocity
+                    )
+                    audio_vel = uncond_audio_vel + guidance_scale * (
+                        cond_audio_vel - uncond_audio_vel
+                    )
+                else:
+                    uncond_velocity = uncond_result
+                    velocity_patches = uncond_velocity + guidance_scale * (
+                        cond_velocity - uncond_velocity
+                    )
             else:
-                velocity_patches = cond_velocity
+                if audio_tokens is not None:
+                    velocity_patches, audio_vel = cond_result
+                else:
+                    velocity_patches = cond_result
 
             # Unpatchify velocity back to latent shape
             velocity = self._unpatchify_latents(
@@ -227,6 +270,12 @@ class Cosmos3GenerationPipeline:
             # Scheduler step (uses internal step_index)
             latents = self.scheduler.step(velocity, t_tensor, latents)
             mx.eval(latents)
+
+            # Audio scheduler step
+            if sound_latents is not None:
+                # audio_vel: [1, sound_len, sound_dim] — already in latent shape
+                sound_latents = audio_scheduler.step(audio_vel, t_tensor, sound_latents)
+                mx.eval(sound_latents)
 
             if (i + 1) % 10 == 0 or i == 0:
                 print(f"  Step {i+1}/{num_inference_steps} (σ={sigma:.4f})")
@@ -241,6 +290,10 @@ class Cosmos3GenerationPipeline:
             # Convert to numpy [T, H, W, C] in [0, 1]
             video = (mx.clip(video[0], -1, 1) + 1) / 2  # [-1,1] -> [0,1]
             result["video"] = video
+
+        if sound_latents is not None:
+            # Store audio latents as [sound_dim, T] channels-first for audio decoder
+            result["audio_latents"] = mx.transpose(sound_latents[0], (1, 0))
 
         print("  Done!")
         return result
