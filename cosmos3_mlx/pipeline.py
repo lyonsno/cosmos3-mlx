@@ -136,18 +136,35 @@ class Cosmos3GenerationPipeline:
         dtype = mx.bfloat16
 
         # 1. Tokenize prompt
-        messages = [{"role": "user", "content": prompt}]
+        # HF reference uses system prompt + resolution template + special tokens
+        system_msg = "You are a helpful assistant who will generate images from a give prompt."
+        res_suffix = f" This image is of {height}x{width} resolution."
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": prompt + res_suffix},
+        ]
         text = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        cond_ids = mx.array([self.tokenizer.encode(text)])
+        tokens = self.tokenizer.encode(text)
+        # Append EOS + vision_start sentinel (tells model generation follows)
+        eos_id = self.tokenizer.eos_token_id
+        vision_start_id = self.tokenizer.convert_tokens_to_ids("<|vision_start|>")
+        tokens = tokens + [eos_id, vision_start_id]
+        cond_ids = mx.array([tokens])
 
-        # Unconditional prompt for CFG
+        # Unconditional prompt for CFG (same structure, empty content)
+        neg_res_suffix = f" This image is not of {height}x{width} resolution."
+        uncond_messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": neg_res_suffix},
+        ]
         uncond_text = self.tokenizer.apply_chat_template(
-            [{"role": "user", "content": ""}],
-            tokenize=False, add_generation_prompt=True,
+            uncond_messages, tokenize=False, add_generation_prompt=True,
         )
-        uncond_ids = mx.array([self.tokenizer.encode(uncond_text)])
+        uncond_tokens = self.tokenizer.encode(uncond_text)
+        uncond_tokens = uncond_tokens + [eos_id, vision_start_id]
+        uncond_ids = mx.array([uncond_tokens])
 
         # 2. Prepare noise latents
         z_dim = self.vae_config.z_dim

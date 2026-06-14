@@ -15,10 +15,17 @@ class FakeTokenizer:
     eos_token_id = 0
 
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
-        return messages[0]["content"]
+        # Return content from last non-system message
+        for msg in reversed(messages):
+            if msg["role"] != "system":
+                return msg["content"]
+        return ""
 
     def encode(self, text, **kwargs):
         return [1, 2, 3, 4, 5]  # Fixed tokens
+
+    def convert_tokens_to_ids(self, token):
+        return 99  # Fake vision_start token
 
 
 class TestGenerationPipeline:
