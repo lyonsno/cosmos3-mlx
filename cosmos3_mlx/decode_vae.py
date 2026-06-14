@@ -331,6 +331,9 @@ def decode_latents(
     std = mx.array(latents_std, dtype=latents.dtype)
     z = latents * std + mean
 
+    # Track input temporal dimension for T=1 vs T>1 behavior differences
+    input_t = z.shape[1]
+
     print(f"    Denormalized latent stats: mean={mx.mean(z).item():.3f}, std={mx.std(z).item():.3f}")
 
     # post_quant_conv: 1x1x1 Conv3D that transforms latent channels before decoder
@@ -395,28 +398,29 @@ def decode_latents(
         t_up = temporal_upsample[block_idx] if block_idx < len(temporal_upsample) else False
 
         if has_upsampler:
-            # HF WanResample: temporal upsampling (time_conv) only runs during
-            # cached/streaming inference (feat_cache is not None). For standard
-            # single-pass decode, always use spatial-only 2D upsample regardless
-            # of whether time_conv weights exist.
-            x = _wan_resample_upsample2d(x, weights, f"{prefix}.upsampler")
+            has_time_conv = f"{prefix}.upsampler.time_conv.weight" in weights
+            if has_time_conv and t_up and input_t > 1:
+                # Multi-frame: full 3D upsample (spatial + temporal)
+                x = _wan_resample_upsample3d(x, weights, f"{prefix}.upsampler")
+            else:
+                # Single-frame or no temporal: spatial-only 2D upsample.
+                # HF's cached path skips time_conv when feat_cache[idx] is None
+                # (first call); for T=1 single-pass this is the correct behavior.
+                x = _wan_resample_upsample2d(x, weights, f"{prefix}.upsampler")
             mx.eval(x)
 
         # DupUp3D residual shortcut + add
         # DupUp3D has no learned weights — it's a pure channel-reshape operation.
-        # Applied when the block has an upsampler (up_flag=True in HF).
-        # HF's _decode always calls with first_chunk=True for the first (and only
-        # in single-image mode) frame. DupUp3D with first_chunk=True applies the
-        # full factor_t temporal expansion then trims: x[:, factor_t-1:, ...].
+        # For T=1: HF uses first_chunk=True which applies factor_t=2 then trims
+        # the first frame. For T>1: full temporal expansion, no trim.
         if is_residual and has_upsampler:
             in_c = x_copy.shape[-1]
             out_c = x.shape[-1]
-            t_up = temporal_upsample[block_idx] if block_idx < len(temporal_upsample) else False
             factor_t = 2 if t_up else 1
             factor_s = 2
             shortcut = _dup_up_3d_residual(x_copy, in_c, out_c, factor_t, factor_s)
-            # first_chunk trim: drop the first (factor_t - 1) temporal frames
-            if factor_t > 1:
+            # first_chunk trim for single-frame decode
+            if factor_t > 1 and input_t == 1:
                 shortcut = shortcut[:, factor_t - 1:, :, :, :]
             x = x + shortcut
             mx.eval(x)
