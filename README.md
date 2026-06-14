@@ -16,10 +16,12 @@ This project ports the Cosmos3-Nano (16B) model to run on Mac using Apple's [MLX
 - [x] Dual-pathway MoT attention with GQA (32 heads / 8 KV heads)
 - [x] Full transformer backbone (36 layers, 4096 hidden, RMSNorm, GLU/SiLU FFN)
 - [x] Autoregressive generation with KV cache
-- [x] Test suite (20 tests passing)
-- [ ] Weight conversion from HuggingFace safetensors
-- [ ] Qwen3-VL vision encoder
-- [ ] End-to-end inference (image in → text out)
+- [x] Weight conversion from HuggingFace safetensors (reasoner-only mode)
+- [x] Qwen3-VL vision encoder (27 layers, PatchEmbed, PatchMerger)
+- [x] Config + weight loading from HuggingFace model directory
+- [x] End-to-end inference pipeline (`python -m cosmos3_mlx`)
+- [x] Test suite (45 tests passing)
+- [ ] End-to-end smoke with real weights
 - [ ] Quantization (4-bit, 8-bit)
 
 ## Architecture
@@ -58,6 +60,24 @@ Phase 1 implements the understanding pathway. The generation pathway is defined 
 git clone https://github.com/lyonsno/cosmos3-mlx.git
 cd cosmos3-mlx
 uv venv && uv pip install -e ".[dev]"
+```
+
+## Usage
+
+Download the model weights (~32GB):
+
+```bash
+huggingface-cli download nvidia/Cosmos3-Nano --local-dir weights/Cosmos3-Nano
+```
+
+Run inference:
+
+```bash
+# Text-only
+python -m cosmos3_mlx --model-dir weights/Cosmos3-Nano --prompt "What is the meaning of life?"
+
+# With image
+python -m cosmos3_mlx --model-dir weights/Cosmos3-Nano --image photo.jpg --prompt "Describe this image"
 ```
 
 ## Test
