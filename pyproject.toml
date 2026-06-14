@@ -1,0 +1,29 @@
+[project]
+name = "cosmos3-mlx"
+version = "0.1.0"
+description = "NVIDIA Cosmos 3 running natively on Apple Silicon via MLX"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "mlx>=0.24.0",
+    "numpy",
+    "safetensors",
+    "huggingface-hub",
+    "tokenizers",
+    "transformers",
+    "pillow",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-xdist",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
