@@ -64,13 +64,10 @@ def load_vision_config(model_dir: str | Path) -> VisionConfig:
 
 def _load_safetensors_shards(directory: Path) -> dict[str, mx.array]:
     """Load all safetensors shards from a directory."""
-    from safetensors import safe_open
-
     weights = {}
     for shard in sorted(directory.glob("*.safetensors")):
-        with safe_open(str(shard), framework="numpy") as f:
-            for key in f.keys():
-                weights[key] = mx.array(f.get_tensor(key))
+        shard_weights = mx.load(str(shard))
+        weights.update(shard_weights)
     return weights
 
 
