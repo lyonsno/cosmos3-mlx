@@ -34,10 +34,16 @@ class UniPCScheduler:
         num_train_timesteps: int = 1000,
         flow_shift: float = 1.0,
         solver_order: int = 2,
+        use_karras_sigmas: bool = True,
+        sigma_min: float = 0.147,
+        sigma_max: float = 200.0,
     ):
         self.num_train_timesteps = num_train_timesteps
         self.flow_shift = flow_shift
         self.solver_order = solver_order
+        self.use_karras_sigmas = use_karras_sigmas
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
 
         self.sigmas = None
         self.timesteps = None
@@ -45,15 +51,31 @@ class UniPCScheduler:
         self.step_index = 0
 
     def set_timesteps(self, num_inference_steps: int):
-        """Set the discrete timesteps for inference using flow sigmas."""
+        """Set the discrete timesteps for inference.
+
+        Uses Karras sigma schedule (matching HF config: use_karras_sigmas=True,
+        use_flow_sigmas=True) converted to flow-matching space.
+        """
         self.num_inference_steps = num_inference_steps
 
-        # Flow sigmas: linear from 1 to near-zero
-        sigmas = np.linspace(1, 1 / self.num_train_timesteps, num_inference_steps + 1)[:-1]
+        if self.use_karras_sigmas:
+            # Karras sigma schedule: concentrate steps at lower noise for detail
+            # rho=7 is the standard Karras value
+            rho = 7.0
+            ramp = np.linspace(0, 1, num_inference_steps)
+            min_inv_rho = self.sigma_min ** (1 / rho)
+            max_inv_rho = self.sigma_max ** (1 / rho)
+            karras_sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
 
-        # Apply flow shift: sigma' = shift * sigma / (1 + (shift - 1) * sigma)
-        if self.flow_shift != 1.0:
-            sigmas = self.flow_shift * sigmas / (1 + (self.flow_shift - 1) * sigmas)
+            # Convert Karras sigmas to flow-matching space: σ_flow = σ / (σ + 1)
+            sigmas = karras_sigmas / (karras_sigmas + 1)
+        else:
+            # Flow sigmas: linear from 1 to near-zero
+            sigmas = np.linspace(1, 1 / self.num_train_timesteps, num_inference_steps + 1)[:-1]
+
+            # Apply flow shift
+            if self.flow_shift != 1.0:
+                sigmas = self.flow_shift * sigmas / (1 + (self.flow_shift - 1) * sigmas)
 
         # Ensure sigma[0] is not exactly 1.0 (causes log(0) in lambda)
         eps = 1e-6
