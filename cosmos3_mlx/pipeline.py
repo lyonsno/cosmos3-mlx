@@ -5,7 +5,11 @@ embedding, video VAE decoder, and audio decoder into a complete
 text-to-image/video generation flow.
 """
 
+import subprocess
+import tempfile
 import time
+import wave
+from pathlib import Path
 from typing import Optional
 
 import mlx.core as mx
@@ -297,6 +301,99 @@ class Cosmos3GenerationPipeline:
 
         print("  Done!")
         return result
+
+
+def save_video(
+    video_frames: np.ndarray,
+    output_path: str,
+    fps: int = 25,
+    audio_waveform: np.ndarray = None,
+    audio_sample_rate: int = 48000,
+) -> str:
+    """Save video frames (and optional audio) as MP4 or GIF.
+
+    Args:
+        video_frames: [T, H, W, 3] uint8 frames
+        output_path: output file path (.mp4 or .gif)
+        fps: video frame rate
+        audio_waveform: optional [2, N] or [N] float audio in [-1, 1]
+        audio_sample_rate: audio sample rate in Hz
+
+    Returns:
+        output path
+    """
+    output_path = str(output_path)
+    is_mp4 = output_path.endswith(".mp4")
+
+    if is_mp4 and audio_waveform is not None:
+        # Write frames as PNG sequence + WAV, mux with ffmpeg
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from PIL import Image
+
+            # Write frames
+            for i, frame in enumerate(video_frames):
+                Image.fromarray(frame).save(f"{tmpdir}/frame_{i:04d}.png")
+
+            # Write WAV
+            wav_path = f"{tmpdir}/audio.wav"
+            if audio_waveform.ndim == 1:
+                audio_waveform = audio_waveform[np.newaxis, :]
+            n_channels = audio_waveform.shape[0]
+            audio_int16 = (audio_waveform * 32767).clip(-32768, 32767).astype(np.int16)
+            with wave.open(wav_path, "w") as wf:
+                wf.setnchannels(n_channels)
+                wf.setsampwidth(2)
+                wf.setframerate(audio_sample_rate)
+                if n_channels > 1:
+                    interleaved = np.stack(
+                        [audio_int16[c] for c in range(n_channels)], axis=-1
+                    ).flatten()
+                else:
+                    interleaved = audio_int16[0]
+                wf.writeframes(interleaved.tobytes())
+
+            # Mux with ffmpeg
+            cmd = [
+                "ffmpeg", "-y",
+                "-framerate", str(fps),
+                "-i", f"{tmpdir}/frame_%04d.png",
+                "-i", wav_path,
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k",
+                "-shortest",
+                output_path,
+            ]
+            subprocess.run(cmd, capture_output=True, check=True)
+
+    elif is_mp4:
+        # Video-only MP4
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from PIL import Image
+
+            for i, frame in enumerate(video_frames):
+                Image.fromarray(frame).save(f"{tmpdir}/frame_{i:04d}.png")
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-framerate", str(fps),
+                "-i", f"{tmpdir}/frame_%04d.png",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                output_path,
+            ]
+            subprocess.run(cmd, capture_output=True, check=True)
+
+    else:
+        # GIF fallback
+        from PIL import Image
+
+        frames = [Image.fromarray(f) for f in video_frames]
+        duration = int(1000 / fps)
+        frames[0].save(
+            output_path, save_all=True, append_images=frames[1:],
+            duration=duration, loop=0,
+        )
+
+    return output_path
 
 
 def run_generation_smoke(model_dir: str):
