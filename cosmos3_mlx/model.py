@@ -350,10 +350,12 @@ class Cosmos3Model(nn.Module):
         text_position_ids = mx.stack([text_pos, text_pos, text_pos])  # [3, 1, text_len]
 
         # Generation tokens: proper spatial grid positions
-        # Temporal axis: frame index, repeated across spatial grid
-        # Height axis: row index within each frame (reset to 0 per frame)
-        # Width axis: column index within each frame (reset to 0 per frame)
-        temporal_offset = text_len
+        # Temporal axis: frame index with large modality margin from text
+        # Reference uses unified_3d_mrope_temporal_modality_margin=15000
+        # so gen tokens start at text_len + 15000 in the temporal axis
+        # Height/Width axes: reset to 0 (spatial grid within each frame)
+        temporal_margin = 15000
+        temporal_offset = text_len + temporal_margin
         t_idx = (mx.arange(grid_t) + temporal_offset).reshape(-1, 1)  # [T, 1]
         t_idx = mx.broadcast_to(t_idx, (grid_t, grid_h * grid_w)).reshape(1, -1)  # [1, T*H*W]
 
