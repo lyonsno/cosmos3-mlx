@@ -339,7 +339,9 @@ class Cosmos3Model(nn.Module):
         gen_h = self.proj_in(gen_tokens)
 
         # Add timestep embedding to generation tokens
-        t_emb = self.time_embedder(timestep)  # [batch, hidden_size]
+        # Reference applies timestep_scale=0.001 before sinusoidal encoding
+        scaled_t = timestep * 0.001
+        t_emb = self.time_embedder(scaled_t)  # [batch, hidden_size]
         gen_h = gen_h + mx.expand_dims(t_emb, 1)
 
         # Build 3D mRoPE position IDs

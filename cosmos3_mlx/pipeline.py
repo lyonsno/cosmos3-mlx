@@ -172,15 +172,14 @@ class Cosmos3GenerationPipeline:
         print(f"  Denoising steps: {num_inference_steps}")
 
         # 4. Denoising loop
-        timestep_list = self.scheduler.timesteps.tolist()
-        for i, t in enumerate(timestep_list):
-            t_val = float(t)
+        for i in range(num_inference_steps):
+            sigma = float(self.scheduler.sigmas[i].item())
 
             # Patchify current latents
             gen_tokens = self._patchify_latents(latents).astype(dtype)
 
-            # Timestep tensor
-            t_tensor = mx.array([t_val]).astype(dtype)
+            # Timestep tensor (sigma * num_train_timesteps)
+            t_tensor = mx.array([sigma * self.scheduler.num_train_timesteps]).astype(dtype)
 
             # Conditional forward: get velocity prediction
             cond_velocity = self.model.diffusion_forward(
@@ -208,22 +207,12 @@ class Cosmos3GenerationPipeline:
                 velocity_patches, t_lat, h_p, w_p
             )
 
-            # Scheduler step
-            next_t = (
-                self.scheduler.timesteps[i + 1].item()
-                if i + 1 < len(self.scheduler.timesteps.tolist())
-                else 0.0
-            )
-            latents = self.scheduler.step(
-                velocity,
-                mx.array(t_val),
-                latents,
-                mx.array(next_t),
-            )
+            # Scheduler step (uses internal step_index)
+            latents = self.scheduler.step(velocity, t_tensor, latents)
             mx.eval(latents)
 
             if (i + 1) % 10 == 0 or i == 0:
-                print(f"  Step {i+1}/{num_inference_steps} (t={t_val:.4f})")
+                print(f"  Step {i+1}/{num_inference_steps} (σ={sigma:.4f})")
 
         # 5. Decode latents
         result = {"latents": latents}

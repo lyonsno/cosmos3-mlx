@@ -219,11 +219,12 @@ class TestDiffusionForward:
         text_ids = mx.array([[1, 2, 3]])
         gen_tokens = mx.random.normal((1, 4, 32))
 
+        # Use scheduler-scale timesteps (sigma * 1000)
         v_early = small_model.diffusion_forward(
-            text_ids, gen_tokens, mx.array([0.9]), grid_t=1, grid_h=2, grid_w=2
+            text_ids, gen_tokens, mx.array([900.0]), grid_t=1, grid_h=2, grid_w=2
         )
         v_late = small_model.diffusion_forward(
-            text_ids, gen_tokens, mx.array([0.1]), grid_t=1, grid_h=2, grid_w=2
+            text_ids, gen_tokens, mx.array([100.0]), grid_t=1, grid_h=2, grid_w=2
         )
         mx.eval(v_early, v_late)
         assert not mx.allclose(v_early, v_late, atol=1e-4).item()
