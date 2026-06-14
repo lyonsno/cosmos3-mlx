@@ -141,3 +141,89 @@ class TestCosmos3ModelGenerate:
         tokens_b = small_model.generate(prompt, max_tokens=4, temperature=0.0)
         mx.eval(tokens_a, tokens_b)
         assert mx.array_equal(tokens_a, tokens_b).item()
+
+
+class TestDiffusionForward:
+    """Test the diffusion generation forward pass."""
+
+    @pytest.fixture
+    def small_model(self):
+        cfg = Cosmos3Config(
+            hidden_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            intermediate_size=256,
+            vocab_size=1000,
+            mrope_section=[6, 5, 5],
+        )
+        model = Cosmos3Model(cfg)
+        # Match patch_latent_dim = z_dim(8) * patch_size(2)^2 = 32
+        model.proj_in = nn.Linear(32, 128, bias=True)
+        model.proj_out = nn.Linear(128, 32, bias=True)
+        return model
+
+    def test_diffusion_forward_shape(self, small_model):
+        """Velocity prediction should match input patch shape."""
+        text_ids = mx.array([[1, 2, 3, 4, 5]])
+        gen_tokens = mx.random.normal((1, 4, 32))  # 4 patches
+        t = mx.array([0.5])
+        velocity = small_model.diffusion_forward(
+            text_ids, gen_tokens, t, grid_t=1, grid_h=2, grid_w=2
+        )
+        mx.eval(velocity)
+        assert velocity.shape == (1, 4, 32)
+
+    def test_diffusion_forward_no_nan(self, small_model):
+        """Diffusion forward should not produce NaN."""
+        text_ids = mx.array([[1, 2, 3]])
+        gen_tokens = mx.random.normal((1, 8, 32))  # 2x2x2 grid
+        t = mx.array([0.5])
+        velocity = small_model.diffusion_forward(
+            text_ids, gen_tokens, t, grid_t=2, grid_h=2, grid_w=2
+        )
+        mx.eval(velocity)
+        assert not mx.any(mx.isnan(velocity)).item()
+
+    def test_spatial_position_ids_affect_output(self, small_model):
+        """Different grid shapes with same num_patches should produce different outputs.
+
+        This verifies that the spatial grid mRoPE positions are actually being used,
+        not just flat sequential positions.
+        """
+        text_ids = mx.array([[1, 2, 3]])
+        gen_tokens = mx.random.normal((1, 4, 32))
+        t = mx.array([0.5])
+
+        # Same 4 patches, but different spatial arrangements
+        v_2x2 = small_model.diffusion_forward(
+            text_ids, gen_tokens, t, grid_t=1, grid_h=2, grid_w=2
+        )
+        v_1x4 = small_model.diffusion_forward(
+            text_ids, gen_tokens, t, grid_t=1, grid_h=1, grid_w=4
+        )
+        v_4x1 = small_model.diffusion_forward(
+            text_ids, gen_tokens, t, grid_t=1, grid_h=4, grid_w=1
+        )
+        mx.eval(v_2x2, v_1x4, v_4x1)
+
+        # All should be different because spatial positions differ
+        assert not mx.allclose(v_2x2, v_1x4, atol=1e-4).item(), \
+            "2x2 and 1x4 grids produced identical output — spatial positions not working"
+        assert not mx.allclose(v_2x2, v_4x1, atol=1e-4).item(), \
+            "2x2 and 4x1 grids produced identical output — spatial positions not working"
+
+    def test_different_timesteps_different_velocity(self, small_model):
+        """Different timesteps should produce different velocities."""
+        text_ids = mx.array([[1, 2, 3]])
+        gen_tokens = mx.random.normal((1, 4, 32))
+
+        v_early = small_model.diffusion_forward(
+            text_ids, gen_tokens, mx.array([0.9]), grid_t=1, grid_h=2, grid_w=2
+        )
+        v_late = small_model.diffusion_forward(
+            text_ids, gen_tokens, mx.array([0.1]), grid_t=1, grid_h=2, grid_w=2
+        )
+        mx.eval(v_early, v_late)
+        assert not mx.allclose(v_early, v_late, atol=1e-4).item()

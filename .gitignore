@@ -8,3 +8,7 @@ build/
 .pytest_cache/
 *.safetensors
 *.npz
+weights/
+*.png
+*.gif
+*.mp4

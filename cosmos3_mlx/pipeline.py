@@ -184,13 +184,18 @@ class Cosmos3GenerationPipeline:
 
             # Conditional forward: get velocity prediction
             cond_velocity = self.model.diffusion_forward(
-                cond_ids, gen_tokens, t_tensor
+                cond_ids, gen_tokens, t_tensor,
+                grid_t=t_lat, grid_h=h_p, grid_w=w_p,
             )
 
             # Classifier-free guidance
             if guidance_scale != 1.0:
+                # Eval conditional velocity first to free its computation graph
+                # before building the unconditional graph (halves peak memory)
+                mx.eval(cond_velocity)
                 uncond_velocity = self.model.diffusion_forward(
-                    uncond_ids, gen_tokens, t_tensor
+                    uncond_ids, gen_tokens, t_tensor,
+                    grid_t=t_lat, grid_h=h_p, grid_w=w_p,
                 )
                 velocity_patches = uncond_velocity + guidance_scale * (
                     cond_velocity - uncond_velocity

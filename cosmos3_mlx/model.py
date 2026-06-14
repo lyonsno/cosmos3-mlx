@@ -307,6 +307,9 @@ class Cosmos3Model(nn.Module):
         input_ids: mx.array,
         gen_tokens: mx.array,
         timestep: mx.array,
+        grid_t: int = 1,
+        grid_h: int = 1,
+        grid_w: int = 1,
     ) -> mx.array:
         """Forward pass for diffusion generation (one denoising step).
 
@@ -318,6 +321,9 @@ class Cosmos3Model(nn.Module):
             input_ids: [batch, text_len] text token IDs
             gen_tokens: [batch, num_patches, patch_latent_dim] patchified latents
             timestep: [batch] current diffusion timestep
+            grid_t: temporal grid size (number of latent frames)
+            grid_h: height grid size (latent height / patch_size)
+            grid_w: width grid size (latent width / patch_size)
 
         Returns:
             [batch, num_patches, patch_latent_dim] velocity prediction
@@ -336,10 +342,29 @@ class Cosmos3Model(nn.Module):
         t_emb = self.time_embedder(timestep)  # [batch, hidden_size]
         gen_h = gen_h + mx.expand_dims(t_emb, 1)
 
-        # Build position IDs for full sequence
-        total_len = text_len + num_patches
-        pos = mx.arange(total_len)[None, :]
-        position_ids = mx.stack([pos, pos, pos])  # [3, 1, total_len]
+        # Build 3D mRoPE position IDs
+        # Text tokens: all 3 axes share monotonically increasing IDs
+        text_pos = mx.arange(text_len)[None, :]  # [1, text_len]
+        text_position_ids = mx.stack([text_pos, text_pos, text_pos])  # [3, 1, text_len]
+
+        # Generation tokens: proper spatial grid positions
+        # Temporal axis: frame index, repeated across spatial grid
+        # Height axis: row index within each frame (reset to 0 per frame)
+        # Width axis: column index within each frame (reset to 0 per frame)
+        temporal_offset = text_len
+        t_idx = (mx.arange(grid_t) + temporal_offset).reshape(-1, 1)  # [T, 1]
+        t_idx = mx.broadcast_to(t_idx, (grid_t, grid_h * grid_w)).reshape(1, -1)  # [1, T*H*W]
+
+        h_idx = mx.arange(grid_h).reshape(1, -1, 1)  # [1, H, 1]
+        h_idx = mx.broadcast_to(h_idx, (grid_t, grid_h, grid_w)).reshape(1, -1)  # [1, T*H*W]
+
+        w_idx = mx.arange(grid_w).reshape(1, 1, -1)  # [1, 1, W]
+        w_idx = mx.broadcast_to(w_idx, (grid_t, grid_h, grid_w)).reshape(1, -1)  # [1, T*H*W]
+
+        gen_position_ids = mx.stack([t_idx, h_idx, w_idx])  # [3, 1, num_patches]
+
+        # Concatenate text + generation position IDs
+        position_ids = mx.concatenate([text_position_ids, gen_position_ids], axis=2)
 
         # Forward through all layers with both pathways
         for layer in self.layers:

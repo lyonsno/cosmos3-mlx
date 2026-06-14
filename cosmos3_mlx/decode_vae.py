@@ -161,8 +161,10 @@ def decode_latents(
 
     mean = mx.array(latents_mean, dtype=latents.dtype)
     std = mx.array(latents_std, dtype=latents.dtype)
-    inv_std = 1.0 / std
-    z = latents / inv_std + mean
+    # Denormalize: the encoder normalizes as `(z - mean) / std`, so
+    # to recover z we compute `latents * std + mean`.
+    # This matches the HF reference: `latents / (1/std) + mean`.
+    z = latents * std + mean
 
     print(f"    Denormalized latent stats: mean={mx.mean(z).item():.3f}, std={mx.std(z).item():.3f}")
 
