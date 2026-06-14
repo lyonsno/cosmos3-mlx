@@ -134,16 +134,23 @@ class Cosmos3Attention(nn.Module):
         v_t = mx.transpose(v_attn, (0, 2, 1, 3))
 
         # Causal attention for understanding pathway
-        if cache is not None:
-            # During generation, no causal mask needed (attending to full cache)
+        q_len = q_t.shape[2]
+        k_len = k_t.shape[2]
+
+        if q_len == 1:
+            # Single-token generation: no mask needed
             attn_out = mx.fast.scaled_dot_product_attention(
                 q_t, k_t, v_t, scale=self.scale
             )
         else:
-            # Prefill: use causal mask
-            mask = nn.MultiHeadAttention.create_additive_causal_mask(
-                q_t.shape[2], dtype=q_t.dtype
+            # Prefill or multi-token: apply causal mask
+            # Create full causal mask over key length, take last q_len rows
+            full_mask = nn.MultiHeadAttention.create_additive_causal_mask(
+                k_len, dtype=q_t.dtype
             )
+            # When cache is present, we only have q_len query positions
+            # corresponding to the last q_len rows of the full causal mask
+            mask = full_mask[-q_len:]
             attn_out = mx.fast.scaled_dot_product_attention(
                 q_t, k_t, v_t, scale=self.scale, mask=mask
             )

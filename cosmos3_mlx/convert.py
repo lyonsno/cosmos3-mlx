@@ -56,7 +56,7 @@ def map_weight_name(name: str) -> str:
 
 def _is_generation_weight(name: str) -> bool:
     """Check if a weight belongs to the generation/diffusion pathway."""
-    return any(p.match(name) for p in _GENERATION_RE)
+    return any(p.search(name) for p in _GENERATION_RE)
 
 
 def convert_weights(

@@ -293,6 +293,62 @@ class VisionModel(nn.Module):
             spatial_merge_size=config.spatial_merge_size,
         )
 
+    def _compute_3d_rotary_pos_emb(self, grid_thw: mx.array) -> tuple[mx.array, mx.array]:
+        """Compute 3D-aware rotary position embeddings from grid dimensions.
+
+        Each patch gets position IDs based on its (temporal, height, width) location,
+        not just a flat sequence index. This encodes spatial relationships correctly.
+
+        Args:
+            grid_thw: [batch, 3] with (temporal, height, width) grid dims
+
+        Returns:
+            cos, sin: [total_patches, head_dim] position embeddings
+        """
+        head_dim = self.config.hidden_size // self.config.num_heads
+        half_dim = head_dim // 2
+        inv_freq = self.rotary_pos_emb._inv_freq  # [half_dim]
+
+        all_cos = []
+        all_sin = []
+
+        for i in range(grid_thw.shape[0]):
+            t, h, w = grid_thw[i].tolist()
+            t, h, w = int(t), int(h), int(w)
+
+            # Create 3D position grid
+            t_ids = mx.arange(t, dtype=mx.float32)
+            h_ids = mx.arange(h, dtype=mx.float32)
+            w_ids = mx.arange(w, dtype=mx.float32)
+
+            # Meshgrid: each patch gets (t, h, w) coordinates
+            # Flatten to [t*h*w] position IDs for each axis
+            pos_t = mx.repeat(t_ids, h * w)  # [t*h*w]
+            pos_h = mx.tile(mx.repeat(h_ids, w), t)  # [t*h*w]
+            pos_w = mx.tile(w_ids, t * h)  # [t*h*w]
+
+            # Combine: use height and width for the rotary embeddings
+            # (following Qwen3-VL which uses h and w positions interleaved)
+            # Split inv_freq in half for height and width
+            half = half_dim // 2
+            inv_freq_h = inv_freq[:half]
+            inv_freq_w = inv_freq[half:]
+
+            # Compute frequencies for each axis
+            freqs_h = mx.outer(pos_h, inv_freq_h)  # [n_patches, half_dim//2]
+            freqs_w = mx.outer(pos_w, inv_freq_w)  # [n_patches, half_dim//2]
+
+            # Concatenate h and w frequencies
+            freqs = mx.concatenate([freqs_h, freqs_w], axis=-1)  # [n_patches, half_dim]
+            emb = mx.concatenate([freqs, freqs], axis=-1)  # [n_patches, head_dim]
+
+            all_cos.append(mx.cos(emb))
+            all_sin.append(mx.sin(emb))
+
+        cos = mx.concatenate(all_cos, axis=0)
+        sin = mx.concatenate(all_sin, axis=0)
+        return cos, sin
+
     def __call__(self, pixel_values: mx.array, grid_thw: mx.array) -> mx.array:
         """Encode images/video to vision embeddings.
 
@@ -306,12 +362,8 @@ class VisionModel(nn.Module):
         # Patch embedding
         x = self.patch_embed(pixel_values)
 
-        # Compute rotary embeddings for the full sequence
-        total_patches = x.shape[0]
-        cos, sin = self.rotary_pos_emb(total_patches)
-
-        # Expand cos/sin for heads: [seq_len, head_dim] -> [seq_len, num_heads, head_dim]
-        # Actually they broadcast fine as [seq_len, head_dim]
+        # Compute 3D-aware rotary embeddings from grid dimensions
+        cos, sin = self._compute_3d_rotary_pos_emb(grid_thw)
 
         # Forward through transformer blocks
         for block in self.blocks:

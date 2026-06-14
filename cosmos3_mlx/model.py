@@ -147,7 +147,7 @@ class Cosmos3Model(nn.Module):
         self,
         input_ids: mx.array,
         cache: Optional[list] = None,
-    ) -> mx.array:
+    ) -> tuple[mx.array, list]:
         """Forward pass.
 
         Args:
@@ -155,7 +155,8 @@ class Cosmos3Model(nn.Module):
             cache: optional list of KV caches per layer
 
         Returns:
-            logits: [batch, seq_len, vocab_size]
+            (logits, new_caches): logits [batch, seq_len, vocab_size]
+                and list of KV cache tuples per layer
         """
         batch, seq_len = input_ids.shape
 
@@ -184,13 +185,14 @@ class Cosmos3Model(nn.Module):
         h = self.norm(h)
         logits = self.lm_head(h)
 
-        return logits
+        return logits, new_caches
 
     def generate(
         self,
         input_ids: mx.array,
         max_tokens: int = 100,
         temperature: float = 1.0,
+        eos_token_id: Optional[int] = None,
     ) -> mx.array:
         """Autoregressive text generation with KV cache.
 
@@ -198,29 +200,13 @@ class Cosmos3Model(nn.Module):
             input_ids: [batch, prompt_len] prompt token IDs
             max_tokens: number of tokens to generate
             temperature: sampling temperature (0 = greedy)
+            eos_token_id: stop generation when this token is produced
 
         Returns:
-            [batch, prompt_len + max_tokens] full token sequence
+            [batch, prompt_len + generated] full token sequence
         """
-        # Prefill
-        cache = [None] * len(self.layers)
-        logits = self.__call__(input_ids, cache=cache)
-
-        # Initialize cache from prefill
-        # The cache is already populated by the forward pass
-        # We need to collect it properly
-        h = self.embed_tokens(input_ids)
-        batch, seq_len = input_ids.shape
-        pos = mx.arange(seq_len)[None, :]
-        position_ids = mx.stack([pos, pos, pos])
-
-        caches = []
-        for i, layer in enumerate(self.layers):
-            h, layer_cache = layer(h, position_ids, cache=None)
-            caches.append(layer_cache)
-
-        h = self.norm(h)
-        logits = self.lm_head(h)
+        # Prefill: single forward pass, get logits + cache
+        logits, caches = self.__call__(input_ids)
         mx.eval(logits, *[c for cache_pair in caches for c in cache_pair])
 
         tokens = [input_ids]
@@ -237,20 +223,12 @@ class Cosmos3Model(nn.Module):
 
             tokens.append(next_token)
 
+            # Check EOS
+            if eos_token_id is not None and next_token.item() == eos_token_id:
+                break
+
             # Forward single token with cache
-            h = self.embed_tokens(next_token)
-            cache_len = caches[0][0].shape[1]
-            pos = mx.array([[cache_len]])
-            position_ids = mx.stack([pos, pos, pos])
-
-            new_caches = []
-            for i, layer in enumerate(self.layers):
-                h, layer_cache = layer(h, position_ids, cache=caches[i])
-                new_caches.append(layer_cache)
-            caches = new_caches
-
-            h = self.norm(h)
-            logits = self.lm_head(h)
+            logits, caches = self.__call__(next_token, cache=caches)
             mx.eval(logits, *[c for cache_pair in caches for c in cache_pair])
 
         return mx.concatenate(tokens, axis=1)

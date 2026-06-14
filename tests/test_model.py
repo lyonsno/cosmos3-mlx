@@ -62,13 +62,13 @@ class TestCosmos3Model:
         """Forward pass should produce logits with vocab_size last dim."""
         batch, seq_len = 1, 8
         input_ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
-        logits = small_model(input_ids)
+        logits, _ = small_model(input_ids)
         assert logits.shape == (batch, seq_len, 1000)
 
     def test_forward_no_nan(self, small_model):
         """Forward pass should not produce NaN values."""
         input_ids = mx.array([[1, 2, 3, 4, 5]])
-        logits = small_model(input_ids)
+        logits, _ = small_model(input_ids)
         mx.eval(logits)
         assert not mx.any(mx.isnan(logits)).item(), "Model produced NaN logits"
 
@@ -77,8 +77,8 @@ class TestCosmos3Model:
         short_ids = mx.array([[1, 2, 3, 4]])
         long_ids = mx.array([[1, 2, 3, 4, 5, 6]])
 
-        logits_short = small_model(short_ids)
-        logits_long = small_model(long_ids)
+        logits_short, _ = small_model(short_ids)
+        logits_long, _ = small_model(long_ids)
         mx.eval(logits_short, logits_long)
 
         # First 4 positions should be identical
@@ -89,8 +89,8 @@ class TestCosmos3Model:
         """Different input sequences should produce different logits."""
         ids_a = mx.array([[1, 2, 3, 4]])
         ids_b = mx.array([[5, 6, 7, 8]])
-        logits_a = small_model(ids_a)
-        logits_b = small_model(ids_b)
+        logits_a, _ = small_model(ids_a)
+        logits_b, _ = small_model(ids_b)
         mx.eval(logits_a, logits_b)
         assert not mx.allclose(logits_a, logits_b, atol=1e-6).item()
 
@@ -100,9 +100,9 @@ class TestCosmos3Model:
         ids_b = mx.array([[4, 5, 6]])
         ids_batch = mx.array([[1, 2, 3], [4, 5, 6]])
 
-        logits_a = small_model(ids_a)
-        logits_b = small_model(ids_b)
-        logits_batch = small_model(ids_batch)
+        logits_a, _ = small_model(ids_a)
+        logits_b, _ = small_model(ids_b)
+        logits_batch, _ = small_model(ids_batch)
         mx.eval(logits_a, logits_b, logits_batch)
 
         assert mx.allclose(logits_a, logits_batch[:1], atol=1e-5).item()

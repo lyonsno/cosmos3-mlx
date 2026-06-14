@@ -108,10 +108,14 @@ def generate_text(
         # For now, just do text-only generation
         pass
 
+    # Get EOS token for early stopping
+    eos_token_id = tokenizer.eos_token_id
+
     output_ids = model.generate(
         input_ids,
         max_tokens=max_tokens,
         temperature=temperature,
+        eos_token_id=eos_token_id,
     )
     mx.eval(output_ids)
 
