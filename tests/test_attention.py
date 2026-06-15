@@ -32,7 +32,7 @@ class TestCosmos3Attention:
             mx.arange(seq_len)[None, :],
         ])
 
-        out_und, out_gen, _ = attn(
+        out_und, out_gen, _, _ = attn(
             hidden_states=x,
             position_ids=position_ids,
             understanding_mask=None,
@@ -53,7 +53,7 @@ class TestCosmos3Attention:
             mx.arange(und_len + gen_len)[None, :],
         ])
 
-        out_und, out_gen, _ = attn(
+        out_und, out_gen, _, _ = attn(
             hidden_states=und_tokens,
             position_ids=position_ids,
             understanding_mask=None,
@@ -74,7 +74,7 @@ class TestCosmos3Attention:
         ])
 
         # Full sequence
-        out_full, _, __ = attn(
+        out_full, _, __, ___ = attn(
             hidden_states=x,
             position_ids=position_ids,
             understanding_mask=None,
@@ -82,7 +82,7 @@ class TestCosmos3Attention:
         )
 
         # Truncated to first 4 tokens — should match if causal
-        out_trunc, _, __ = attn(
+        out_trunc, _, __, ___ = attn(
             hidden_states=x[:, :4],
             position_ids=position_ids[:, :, :4],
             understanding_mask=None,
@@ -124,7 +124,7 @@ class TestCosmos3AttentionKVCache:
         ])
 
         # Full forward
-        out_full, _, __ = attn(
+        out_full, _, __, ___ = attn(
             hidden_states=x,
             position_ids=position_ids,
             understanding_mask=None,
@@ -137,7 +137,7 @@ class TestCosmos3AttentionKVCache:
         outputs = []
         for i in range(seq_len):
             pos_ids = position_ids[:, :, i : i + 1]
-            out_i, _, cache = attn(
+            out_i, _, cache, _ = attn(
                 hidden_states=x[:, i : i + 1],
                 position_ids=pos_ids,
                 understanding_mask=None,

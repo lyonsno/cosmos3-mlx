@@ -169,7 +169,24 @@ class Cosmos3Attention(nn.Module):
                 position_ids, und_len,
             )
 
-        return und_output, gen_output, new_cache
+        return und_output, gen_output, new_cache, (k_unexpanded, v_unexpanded)
+
+    def generation_only_forward(
+        self,
+        gen_tokens: mx.array,
+        und_kv: Tuple[mx.array, mx.array],
+        position_ids: mx.array,
+        und_len: int,
+    ) -> mx.array:
+        """Generation pathway only, using cached understanding K/V.
+
+        Skips the entire understanding pathway (Q/K/V projection, attention, output).
+        Uses pre-computed understanding keys/values for cross-attention.
+        """
+        return self._generation_forward(
+            gen_tokens, None, und_kv[0], und_kv[1],
+            position_ids, und_len,
+        )
 
     def _generation_forward(
         self,

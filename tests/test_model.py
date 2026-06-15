@@ -169,7 +169,7 @@ class TestDiffusionForward:
         text_ids = mx.array([[1, 2, 3, 4, 5]])
         gen_tokens = mx.random.normal((1, 4, 32))  # 4 patches
         t = mx.array([0.5])
-        velocity = small_model.diffusion_forward(
+        velocity, _ = small_model.diffusion_forward(
             text_ids, gen_tokens, t, grid_t=1, grid_h=2, grid_w=2
         )
         mx.eval(velocity)
@@ -180,7 +180,7 @@ class TestDiffusionForward:
         text_ids = mx.array([[1, 2, 3]])
         gen_tokens = mx.random.normal((1, 8, 32))  # 2x2x2 grid
         t = mx.array([0.5])
-        velocity = small_model.diffusion_forward(
+        velocity, _ = small_model.diffusion_forward(
             text_ids, gen_tokens, t, grid_t=2, grid_h=2, grid_w=2
         )
         mx.eval(velocity)
@@ -197,13 +197,13 @@ class TestDiffusionForward:
         t = mx.array([0.5])
 
         # Same 4 patches, but different spatial arrangements
-        v_2x2 = small_model.diffusion_forward(
+        v_2x2, _ = small_model.diffusion_forward(
             text_ids, gen_tokens, t, grid_t=1, grid_h=2, grid_w=2
         )
-        v_1x4 = small_model.diffusion_forward(
+        v_1x4, _ = small_model.diffusion_forward(
             text_ids, gen_tokens, t, grid_t=1, grid_h=1, grid_w=4
         )
-        v_4x1 = small_model.diffusion_forward(
+        v_4x1, _ = small_model.diffusion_forward(
             text_ids, gen_tokens, t, grid_t=1, grid_h=4, grid_w=1
         )
         mx.eval(v_2x2, v_1x4, v_4x1)
@@ -220,10 +220,10 @@ class TestDiffusionForward:
         gen_tokens = mx.random.normal((1, 4, 32))
 
         # Use scheduler-scale timesteps (sigma * 1000)
-        v_early = small_model.diffusion_forward(
+        v_early, _ = small_model.diffusion_forward(
             text_ids, gen_tokens, mx.array([900.0]), grid_t=1, grid_h=2, grid_w=2
         )
-        v_late = small_model.diffusion_forward(
+        v_late, _ = small_model.diffusion_forward(
             text_ids, gen_tokens, mx.array([100.0]), grid_t=1, grid_h=2, grid_w=2
         )
         mx.eval(v_early, v_late)

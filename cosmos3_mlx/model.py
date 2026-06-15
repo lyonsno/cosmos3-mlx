@@ -99,7 +99,7 @@ class Cosmos3DecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self-attention (understanding pathway only)
-        attn_out, _, new_cache = self.self_attn(
+        attn_out, _, new_cache, _ = self.self_attn(
             hidden_states=hidden_states,
             position_ids=position_ids,
             understanding_mask=None,
@@ -123,7 +123,7 @@ class Cosmos3DecoderLayer(nn.Module):
         und_hidden: mx.array,
         gen_hidden: mx.array,
         position_ids: mx.array,
-    ) -> Tuple[mx.array, mx.array]:
+    ) -> Tuple[mx.array, mx.array, Tuple[mx.array, mx.array]]:
         """Forward pass with both understanding and generation pathways.
 
         Args:
@@ -132,7 +132,7 @@ class Cosmos3DecoderLayer(nn.Module):
             position_ids: [3, batch, und_len + gen_len]
 
         Returns:
-            (und_output, gen_output)
+            (und_output, gen_output, und_kv) where und_kv is cached (keys, values)
         """
         # Understanding pre-norm
         und_residual = und_hidden
@@ -143,7 +143,7 @@ class Cosmos3DecoderLayer(nn.Module):
         gen_normed = self.input_layernorm_moe_gen(gen_hidden)
 
         # Dual-pathway attention
-        und_attn, gen_attn, _ = self.self_attn(
+        und_attn, gen_attn, _, und_kv = self.self_attn(
             hidden_states=und_normed,
             position_ids=position_ids,
             understanding_mask=None,
@@ -164,7 +164,34 @@ class Cosmos3DecoderLayer(nn.Module):
         gen_hidden = self.mlp_moe_gen(gen_hidden)
         gen_hidden = gen_residual + gen_hidden
 
-        return und_hidden, gen_hidden
+        return und_hidden, gen_hidden, und_kv
+
+    def forward_generation_cached(
+        self,
+        gen_hidden: mx.array,
+        und_kv: Tuple[mx.array, mx.array],
+        position_ids: mx.array,
+        und_len: int,
+    ) -> mx.array:
+        """Forward pass for generation pathway only, using cached understanding K/V.
+
+        Skips the entire understanding pathway. Used for denoising steps 1+ when
+        the text tokens haven't changed.
+        """
+        gen_residual = gen_hidden
+        gen_normed = self.input_layernorm_moe_gen(gen_hidden)
+
+        gen_attn = self.self_attn.generation_only_forward(
+            gen_normed, und_kv, position_ids, und_len,
+        )
+
+        gen_hidden = gen_residual + gen_attn
+        gen_residual = gen_hidden
+        gen_hidden = self.post_attention_layernorm_moe_gen(gen_hidden)
+        gen_hidden = self.mlp_moe_gen(gen_hidden)
+        gen_hidden = gen_residual + gen_hidden
+
+        return gen_hidden
 
 
 class Cosmos3Model(nn.Module):
@@ -408,9 +435,63 @@ class Cosmos3Model(nn.Module):
         position_ids = mx.concatenate([text_position_ids, gen_position_ids], axis=2)
 
         # Forward through all layers with both pathways
+        und_kv_cache = []
         for layer in self.layers:
-            und_h, gen_h = layer.forward_with_generation(
+            und_h, gen_h, und_kv = layer.forward_with_generation(
                 und_h, gen_h, position_ids
+            )
+            und_kv_cache.append(und_kv)
+
+        # Apply generation final norm
+        gen_h = self.norm_moe_gen(gen_h)
+
+        # Split and project back
+        if audio_tokens is not None:
+            vision_h = gen_h[:, :num_patches, :]
+            audio_h = gen_h[:, num_patches:, :]
+            vision_velocity = self.proj_out(vision_h)
+            audio_velocity = self.audio_proj_out(audio_h)
+            return (vision_velocity, audio_velocity), und_kv_cache
+        else:
+            velocity = self.proj_out(gen_h)
+            return velocity, und_kv_cache
+
+    def diffusion_forward_cached(
+        self,
+        gen_tokens: mx.array,
+        timestep: mx.array,
+        und_kv_cache: list,
+        position_ids: mx.array,
+        text_len: int,
+        audio_tokens: Optional[mx.array] = None,
+        grid_t: int = 1,
+        grid_h: int = 1,
+        grid_w: int = 1,
+    ) -> mx.array | tuple[mx.array, mx.array]:
+        """Cached diffusion forward — generation pathway only.
+
+        Reuses precomputed understanding K/V from step 0.
+        Only recomputes generation pathway (proj_in, timestep, attention, MLP, proj_out).
+        """
+        num_patches = gen_tokens.shape[1]
+
+        # Project generation tokens + timestep embedding
+        gen_h = self.proj_in(gen_tokens)
+        scaled_t = timestep * 0.001
+        t_emb = self.time_embedder(scaled_t)
+        gen_h = gen_h + mx.expand_dims(t_emb, 1)
+
+        # Handle audio tokens
+        if audio_tokens is not None:
+            audio_h = self.audio_proj_in(audio_tokens)
+            audio_h = audio_h + self.audio_modality_embed
+            audio_h = audio_h + mx.expand_dims(t_emb, 1)
+            gen_h = mx.concatenate([gen_h, audio_h], axis=1)
+
+        # Forward through layers using cached understanding K/V
+        for layer, und_kv in zip(self.layers, und_kv_cache):
+            gen_h = layer.forward_generation_cached(
+                gen_h, und_kv, position_ids, text_len,
             )
 
         # Apply generation final norm

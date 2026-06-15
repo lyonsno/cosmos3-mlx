@@ -72,6 +72,58 @@ class Cosmos3GenerationPipeline:
             self._latents_mean = mx.zeros((z_dim,))
             self._latents_std = mx.ones((z_dim,))
 
+    def _build_position_ids(
+        self,
+        text_len: int,
+        grid_t: int,
+        grid_h: int,
+        grid_w: int,
+        audio_tokens: Optional[mx.array] = None,
+    ) -> mx.array:
+        """Build 3D mRoPE position IDs for text + generation tokens.
+
+        Matches the position ID construction inside diffusion_forward.
+        """
+        # Text positions
+        text_pos = mx.arange(text_len, dtype=mx.float32)[None, :]
+        text_position_ids = mx.stack([text_pos, text_pos, text_pos])
+
+        # Generation positions (FPS-modulated)
+        temporal_margin = 15000
+        temporal_offset = float(text_len + temporal_margin)
+        fps = 25.0
+        video_tcf = 4
+        base_fps = 24.0
+        tps = fps / video_tcf
+        base_tps = base_fps / video_tcf
+
+        frame_indices = mx.arange(grid_t, dtype=mx.float32)
+        scaled_t = frame_indices / tps * base_tps + temporal_offset
+        t_idx = mx.broadcast_to(scaled_t.reshape(-1, 1), (grid_t, grid_h * grid_w)).reshape(1, -1)
+
+        h_idx = mx.arange(grid_h, dtype=mx.float32).reshape(1, -1, 1)
+        h_idx = mx.broadcast_to(h_idx, (grid_t, grid_h, grid_w)).reshape(1, -1)
+
+        w_idx = mx.arange(grid_w, dtype=mx.float32).reshape(1, 1, -1)
+        w_idx = mx.broadcast_to(w_idx, (grid_t, grid_h, grid_w)).reshape(1, -1)
+
+        gen_position_ids = mx.stack([t_idx, h_idx, w_idx])
+
+        # Audio positions
+        if audio_tokens is not None:
+            sound_len = audio_tokens.shape[1]
+            audio_tps = fps / 1.0
+            audio_base_tps = base_fps / 1.0
+            audio_frame_indices = mx.arange(sound_len, dtype=mx.float32)
+            audio_scaled_t = audio_frame_indices / audio_tps * audio_base_tps + temporal_offset
+            audio_t_idx = audio_scaled_t.reshape(1, -1)
+            audio_h_idx = mx.zeros((1, sound_len), dtype=mx.float32)
+            audio_w_idx = mx.zeros((1, sound_len), dtype=mx.float32)
+            audio_position_ids = mx.stack([audio_t_idx, audio_h_idx, audio_w_idx])
+            gen_position_ids = mx.concatenate([gen_position_ids, audio_position_ids], axis=2)
+
+        return mx.concatenate([text_position_ids, gen_position_ids], axis=2)
+
     def _prepare_noise_latents(
         self,
         num_frames: int = 1,
@@ -253,7 +305,14 @@ class Cosmos3GenerationPipeline:
         print(f"  Patches: {num_patches} ({t_lat}×{h_p}×{w_p})")
         print(f"  Denoising steps: {num_inference_steps}")
 
-        # 4. Denoising loop
+        # 4. Denoising loop with text KV caching
+        # Step 0: full forward (both pathways), cache understanding K/V
+        # Steps 1+: generation pathway only, reuse cached K/V
+        cond_kv_cache = None
+        uncond_kv_cache = None
+        cond_position_ids = None
+        uncond_position_ids = None
+
         for i in range(num_inference_steps):
             sigma = float(self.scheduler.sigmas[i].item())
 
@@ -266,12 +325,28 @@ class Cosmos3GenerationPipeline:
             # Audio tokens for this step
             audio_tokens = sound_latents if sound_latents is not None else None
 
-            # Conditional forward: get velocity prediction
-            cond_result = self.model.diffusion_forward(
-                cond_ids, gen_tokens, t_tensor,
-                grid_t=t_lat, grid_h=h_p, grid_w=w_p,
-                audio_tokens=audio_tokens,
-            )
+            if cond_kv_cache is None:
+                # Step 0: full forward, build cache
+                cond_result, cond_kv_cache = self.model.diffusion_forward(
+                    cond_ids, gen_tokens, t_tensor,
+                    grid_t=t_lat, grid_h=h_p, grid_w=w_p,
+                    audio_tokens=audio_tokens,
+                )
+                # Extract position_ids for cached forward (built inside diffusion_forward)
+                # We need to rebuild them here for the cached path
+                cond_text_len = cond_ids.shape[1]
+                cond_position_ids = self._build_position_ids(
+                    cond_text_len, t_lat, h_p, w_p, audio_tokens,
+                )
+                mx.eval(*[kv[0] for kv in cond_kv_cache], *[kv[1] for kv in cond_kv_cache])
+            else:
+                # Steps 1+: cached forward (generation pathway only)
+                cond_result = self.model.diffusion_forward_cached(
+                    gen_tokens, t_tensor, cond_kv_cache,
+                    cond_position_ids, cond_ids.shape[1],
+                    audio_tokens=audio_tokens,
+                    grid_t=t_lat, grid_h=h_p, grid_w=w_p,
+                )
 
             # Classifier-free guidance
             if guidance_scale != 1.0:
@@ -282,11 +357,25 @@ class Cosmos3GenerationPipeline:
                     cond_velocity = cond_result
                     mx.eval(cond_velocity)
 
-                uncond_result = self.model.diffusion_forward(
-                    uncond_ids, gen_tokens, t_tensor,
-                    grid_t=t_lat, grid_h=h_p, grid_w=w_p,
-                    audio_tokens=audio_tokens,
-                )
+                if uncond_kv_cache is None:
+                    # Step 0: full uncond forward, build cache
+                    uncond_result, uncond_kv_cache = self.model.diffusion_forward(
+                        uncond_ids, gen_tokens, t_tensor,
+                        grid_t=t_lat, grid_h=h_p, grid_w=w_p,
+                        audio_tokens=audio_tokens,
+                    )
+                    uncond_text_len = uncond_ids.shape[1]
+                    uncond_position_ids = self._build_position_ids(
+                        uncond_text_len, t_lat, h_p, w_p, audio_tokens,
+                    )
+                    mx.eval(*[kv[0] for kv in uncond_kv_cache], *[kv[1] for kv in uncond_kv_cache])
+                else:
+                    uncond_result = self.model.diffusion_forward_cached(
+                        gen_tokens, t_tensor, uncond_kv_cache,
+                        uncond_position_ids, uncond_ids.shape[1],
+                        audio_tokens=audio_tokens,
+                        grid_t=t_lat, grid_h=h_p, grid_w=w_p,
+                    )
 
                 if audio_tokens is not None:
                     uncond_velocity, uncond_audio_vel = uncond_result
