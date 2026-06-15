@@ -5,6 +5,7 @@ embedding, video VAE decoder, and audio decoder into a complete
 text-to-image/video generation flow.
 """
 
+import json
 import subprocess
 import tempfile
 import time
@@ -21,6 +22,9 @@ from .scheduler import UniPCScheduler
 from .timestep import TimestepEmbedding, apply_timestep_to_noisy_tokens
 from .vae import VAEConfig, WanDecoder
 from .audio import AudioDecoderConfig, AudioDecoder
+
+_SYSTEM_PROMPT_IMAGE = "You are a helpful assistant who will generate images from a give prompt."
+_SYSTEM_PROMPT_VIDEO = "You are a helpful assistant who will generate videos from a give prompt."
 
 
 class Cosmos3GenerationPipeline:
@@ -41,6 +45,7 @@ class Cosmos3GenerationPipeline:
         vae_decoder: Optional[WanDecoder] = None,
         audio_decoder: Optional[AudioDecoder] = None,
         vae_config: Optional[VAEConfig] = None,
+        model_dir: Optional[str | Path] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -48,6 +53,24 @@ class Cosmos3GenerationPipeline:
         self.audio_decoder = audio_decoder
         self.vae_config = vae_config or VAEConfig()
         self.scheduler = UniPCScheduler()
+
+        # Load reference negative prompt if available
+        self._negative_prompt_text = None
+        if model_dir is not None:
+            neg_path = Path(model_dir) / "assets" / "negative_prompt.json"
+            if neg_path.exists():
+                with open(neg_path) as f:
+                    self._negative_prompt_text = json.dumps(json.load(f))
+
+        # Pre-compute latent normalization tensors (must match z_dim)
+        z_dim = self.vae_config.z_dim
+        if len(self.vae_config.latents_mean) == z_dim:
+            self._latents_mean = mx.array(self.vae_config.latents_mean)
+            self._latents_std = mx.array(self.vae_config.latents_std)
+        else:
+            # Fallback for non-standard z_dim (e.g., tests)
+            self._latents_mean = mx.zeros((z_dim,))
+            self._latents_std = mx.ones((z_dim,))
 
     def _prepare_noise_latents(
         self,
@@ -143,12 +166,22 @@ class Cosmos3GenerationPipeline:
         dtype = mx.bfloat16
 
         # 1. Tokenize prompt
-        # HF reference uses system prompt + resolution template + special tokens
-        system_msg = "You are a helpful assistant who will generate images from a give prompt."
-        res_suffix = f" This image is of {height}x{width} resolution."
+        is_image = (num_frames == 1)
+        system_msg = _SYSTEM_PROMPT_IMAGE if is_image else _SYSTEM_PROMPT_VIDEO
+
+        # Build user content with resolution/duration suffix
+        if is_image:
+            user_content = prompt + f" This image is of {height}x{width} resolution."
+        else:
+            fps = 25
+            duration = num_frames / fps
+            user_content = (prompt
+                + f" The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
+                + f" This video is of {height}x{width} resolution.")
+
         messages = [
             {"role": "system", "content": system_msg},
-            {"role": "user", "content": prompt + res_suffix},
+            {"role": "user", "content": user_content},
         ]
         text = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
@@ -160,11 +193,19 @@ class Cosmos3GenerationPipeline:
         tokens = tokens + [eos_id, vision_start_id]
         cond_ids = mx.array([tokens])
 
-        # Unconditional prompt for CFG (same structure, empty content)
-        neg_res_suffix = f" This image is not of {height}x{width} resolution."
+        # Unconditional prompt for CFG
+        # Use reference negative prompt if available, otherwise empty string
+        neg_prompt = self._negative_prompt_text or ""
+        if is_image:
+            neg_suffix = f" This image is not of {height}x{width} resolution."
+        else:
+            neg_suffix = (f" The video is not {duration:.1f} seconds long and is not of {fps:.0f} FPS."
+                + f" This video is not of {height}x{width} resolution.")
+        neg_content = neg_prompt + neg_suffix
+
         uncond_messages = [
             {"role": "system", "content": system_msg},
-            {"role": "user", "content": neg_res_suffix},
+            {"role": "user", "content": neg_content},
         ]
         uncond_text = self.tokenizer.apply_chat_template(
             uncond_messages, tokenize=False, add_generation_prompt=True,
@@ -284,12 +325,19 @@ class Cosmos3GenerationPipeline:
             if (i + 1) % 10 == 0 or i == 0:
                 print(f"  Step {i+1}/{num_inference_steps} (σ={sigma:.4f})")
 
-        # 5. Decode latents
-        result = {"latents": latents}
+        # 5. Denormalize latents and decode
+        # The model operates in normalized latent space: z_norm = (z - mean) / std
+        # Reverse: z = z_norm * std + mean
+        # Latents are channels-last [B, T, H, W, z_dim]; mean/std broadcast on last dim
+        std = self._latents_std.astype(latents.dtype)
+        mean = self._latents_mean.astype(latents.dtype)
+        latents_denorm = latents * std + mean
+
+        result = {"latents": latents_denorm}
 
         if self.vae_decoder is not None:
             print("  Decoding video...")
-            video = self.vae_decoder(latents)
+            video = self.vae_decoder(latents_denorm)
             mx.eval(video)
             # Convert to numpy [T, H, W, C] in [0, 1]
             video = (mx.clip(video[0], -1, 1) + 1) / 2  # [-1,1] -> [0,1]
@@ -414,6 +462,7 @@ def run_generation_smoke(model_dir: str):
     pipeline = Cosmos3GenerationPipeline(
         model=model,
         tokenizer=tokenizer,
+        model_dir=model_dir,
     )
 
     # Generate
