@@ -390,9 +390,11 @@ class Cosmos3Model(nn.Module):
 
             # Audio mRoPE: temporal siblings with video, grid_h=1, grid_w=1
             # Audio: temporal_compression_factor=1, so tps = fps/1 = 25
+            # base_tps for audio uses the audio compression factor (1), not video's (4)
             audio_tps = fps / 1.0  # 25 tokens per second
+            audio_base_tps = base_fps / 1.0  # 24.0 (base_fps / audio_tcf)
             audio_frame_indices = mx.arange(sound_len, dtype=mx.float32)
-            audio_scaled_t = audio_frame_indices / audio_tps * base_tps + temporal_offset
+            audio_scaled_t = audio_frame_indices / audio_tps * audio_base_tps + temporal_offset
             audio_t_idx = audio_scaled_t.reshape(1, -1)
             audio_h_idx = mx.zeros((1, sound_len), dtype=mx.float32)
             audio_w_idx = mx.zeros((1, sound_len), dtype=mx.float32)
