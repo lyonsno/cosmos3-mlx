@@ -154,13 +154,24 @@ class Cosmos3GenerationPipeline:
 
         With patch_size=2: each 2x2 spatial region becomes one token.
         patch_latent_dim = z_dim * patch_size * patch_size = 48 * 4 = 192
+
+        If H or W are not divisible by patch_size, zero-pads to the next
+        multiple (matching HF Cosmos3OmniTransformer._patchify_and_pack_latents).
         """
         batch, t, h, w, z = latents.shape
         p = self.vae_config.patch_size
 
+        # Pad to next multiple of patch_size if needed
+        h_padded = ((h + p - 1) // p) * p
+        w_padded = ((w + p - 1) // p) * p
+        if h_padded != h or w_padded != w:
+            padded = mx.zeros((batch, t, h_padded, w_padded, z), dtype=latents.dtype)
+            padded = padded.at[:, :, :h, :w, :].add(latents)
+            latents = padded
+
         # Reshape into patches
-        h_p = h // p
-        w_p = w // p
+        h_p = h_padded // p
+        w_p = w_padded // p
         # [B, T, H//p, p, W//p, p, z] -> [B, T*H_p*W_p, p*p*z]
         x = latents.reshape(batch, t, h_p, p, w_p, p, z)
         x = mx.transpose(x, (0, 1, 2, 4, 3, 5, 6))  # [B, T, H_p, W_p, p, p, z]
@@ -169,12 +180,15 @@ class Cosmos3GenerationPipeline:
         return x
 
     def _unpatchify_latents(
-        self, tokens: mx.array, t: int, h_p: int, w_p: int
+        self, tokens: mx.array, t: int, h_p: int, w_p: int,
+        h_orig: int = 0, w_orig: int = 0,
     ) -> mx.array:
         """Convert patch tokens back to VAE latent shape.
 
         Input: [batch, num_patches, patch_latent_dim]
         Output: [batch, T, H, W, z_dim]
+
+        If h_orig/w_orig are nonzero, crops back to original (pre-padding) size.
         """
         batch = tokens.shape[0]
         p = self.vae_config.patch_size
@@ -183,6 +197,10 @@ class Cosmos3GenerationPipeline:
         x = tokens.reshape(batch, t, h_p, w_p, p, p, z)
         x = mx.transpose(x, (0, 1, 2, 4, 3, 5, 6))  # [B, T, H_p, p, W_p, p, z]
         x = x.reshape(batch, t, h_p * p, w_p * p, z)
+
+        # Crop back to original size if padded
+        if h_orig > 0 and w_orig > 0:
+            x = x[:, :, :h_orig, :w_orig, :]
 
         return x
 
@@ -358,9 +376,10 @@ class Cosmos3GenerationPipeline:
             mx.eval(latents)
 
         # Patchify: [1, T_lat, H_lat, W_lat, z_dim] -> [1, num_patches, patch_dim]
+        # Use ceil division for non-divisible latent dims (e.g. 720p: h_lat=45)
         p = self.vae_config.patch_size
-        h_p = h_lat // p
-        w_p = w_lat // p
+        h_p = (h_lat + p - 1) // p  # ceil division
+        w_p = (w_lat + p - 1) // p
         num_patches = t_lat * h_p * w_p
 
         # 2b. Prepare audio noise latents if enabled
@@ -478,9 +497,10 @@ class Cosmos3GenerationPipeline:
                 else:
                     velocity_patches = cond_result
 
-            # Unpatchify velocity back to latent shape
+            # Unpatchify velocity back to latent shape, cropping padding
             velocity = self._unpatchify_latents(
-                velocity_patches, t_lat, h_p, w_p
+                velocity_patches, t_lat, h_p, w_p,
+                h_orig=h_lat, w_orig=w_lat,
             )
 
             # Zero velocity at conditioned frame positions (i2v).
