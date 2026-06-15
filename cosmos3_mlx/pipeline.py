@@ -205,9 +205,14 @@ class Cosmos3GenerationPipeline:
     ) -> mx.array:
         """Encode a conditioning image to normalized VAE latents.
 
-        Matches HF Cosmos3OmniPipeline: for i2v, the conditioning frame is
-        repeat-padded across all temporal positions before encoding (the VAE
-        uses causal convolutions that need real content at all positions).
+        Matches HF Cosmos3OmniPipeline: builds a full video tensor with the
+        conditioning frame repeated at every temporal position, then encodes
+        the entire tensor through the VAE. The temporal causal convolutions
+        produce per-frame latents that depend on preceding frames — frame 0
+        sees zero-padded context while frames 1+ see frame 0's features.
+        This is critical for i2v quality: tiling a single-frame encode
+        produces identical latents at every position, but the model expects
+        temporally-varying latents from the causal conv processing.
 
         Args:
             image: [H, W, 3] uint8 or float32 in [0, 1]
@@ -218,7 +223,7 @@ class Cosmos3GenerationPipeline:
         Returns:
             [1, T_lat, H_lat, W_lat, z_dim] normalized latents (channels-last)
         """
-        from .encode_vae import encode_image
+        from .encode_vae import encode_video
 
         vae_dir = str(self._model_dir / "vae")
 
@@ -235,20 +240,13 @@ class Cosmos3GenerationPipeline:
 
         if num_frames == 1:
             # Single image: encode directly
-            return encode_image(image_np, vae_dir)
+            return encode_video(image_np, vae_dir)
 
-        # For video: repeat-pad the conditioning frame across all temporal positions.
-        # HF does: vision_tensor[:, :, 0] = frame; vision_tensor[:, :, 1:] = frame.repeat()
-        # Then encodes the full [1, 3, T, H, W] through the VAE.
-        # Since our encoder only handles single images right now, we encode just frame 0
-        # and tile the latent across the temporal dimension. This is equivalent because
-        # the VAE encoder with single-pass mode skips temporal convolutions (no causal
-        # conv cache), so encoding T copies of the same frame produces T copies of the
-        # same latent.
-        single_latent = encode_image(image_np, vae_dir)  # [1, 1, H_lat, W_lat, z_dim]
-        mx.eval(single_latent)
-        t_lat = max(1, num_frames // 4)
-        return mx.repeat(single_latent, t_lat, axis=1)  # [1, T_lat, H_lat, W_lat, z_dim]
+        # Build full video tensor: conditioning frame repeated at all positions.
+        # HF: vision_tensor[:,:,0] = frame; vision_tensor[:,:,1:] = frame.repeat()
+        # [T, H, W, 3] in [0, 1]
+        video_tensor = np.stack([image_np] * num_frames, axis=0)
+        return encode_video(video_tensor, vae_dir)
 
     def generate(
         self,

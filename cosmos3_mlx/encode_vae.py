@@ -156,18 +156,21 @@ def _patchify_input(x: mx.array, patch_size: int = 2) -> mx.array:
     return x
 
 
-def encode_image(
-    image: np.ndarray,
+def encode_video(
+    video: np.ndarray | mx.array,
     vae_dir: str,
 ) -> mx.array:
-    """Encode an image to normalized VAE latents.
+    """Encode a video (or single image) to normalized VAE latents.
 
     Args:
-        image: [H, W, 3] uint8 or [H, W, 3] float32 in [0, 1]
+        video: [T, H, W, 3] or [H, W, 3] uint8/float32 in [0, 1].
+               For multi-frame input, temporal causal convolutions produce
+               per-frame latents that depend on preceding frames.
         vae_dir: path to vae/ directory with config.json and safetensors
 
     Returns:
-        [1, 1, H//16, W//16, z_dim] normalized latents (channels-last)
+        [1, T_lat, H//16, W//16, z_dim] normalized latents (channels-last)
+        where T_lat = T for single-pass encoding.
     """
     vae_path = Path(vae_dir)
 
@@ -198,16 +201,18 @@ def encode_image(
 
         weights[name] = v.astype(mx.bfloat16)
 
-    # Prepare image: [H, W, 3] -> [1, 1, H, W, 3] normalized to [-1, 1]
-    if isinstance(image, np.ndarray):
-        if image.dtype == np.uint8:
-            image = image.astype(np.float32) / 255.0
-        x = mx.array(image)
+    # Prepare input: normalize to [-1, 1], shape [1, T, H, W, 3]
+    if isinstance(video, np.ndarray):
+        if video.dtype == np.uint8:
+            video = video.astype(np.float32) / 255.0
+        x = mx.array(video)
     else:
-        x = image
+        x = video
 
     if x.ndim == 3:
-        x = mx.expand_dims(mx.expand_dims(x, 0), 0)  # [1, 1, H, W, 3]
+        x = mx.expand_dims(mx.expand_dims(x, 0), 0)  # [H,W,3] -> [1, 1, H, W, 3]
+    elif x.ndim == 4:
+        x = mx.expand_dims(x, 0)  # [T,H,W,3] -> [1, T, H, W, 3]
     x = x * 2.0 - 1.0  # [0,1] -> [-1,1]
     x = x.astype(mx.bfloat16)
 
@@ -317,3 +322,7 @@ def encode_image(
     print(f"    Normalized latent: mean={mx.mean(z_norm).item():.3f}, std={mx.std(z_norm).item():.3f}")
 
     return z_norm
+
+
+# Backward-compatible alias
+encode_image = encode_video
