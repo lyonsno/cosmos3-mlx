@@ -56,29 +56,18 @@ def _wan_resample_downsample2d(x: mx.array, weights: dict, prefix: str) -> mx.ar
 
 
 def _wan_resample_downsample3d(x: mx.array, weights: dict, prefix: str) -> mx.array:
-    """WanResample downsample3d: spatial downsample + temporal downsample.
+    """WanResample downsample3d: spatial downsample only (single-pass mode).
 
-    Temporal: CausalConv3d with stride (2,1,1) halves temporal dimension.
-    Spatial: strided Conv2d halves spatial dimensions.
+    In HF's WanResample, the temporal time_conv is only applied during cached/chunked
+    encoding (feat_cache is not None). For single-pass encoding (our case), only the
+    spatial Conv2d stride-2 downsample runs. The temporal conv is skipped.
 
     Args:
         x: [B, T, H, W, C] channels-last
         weights: dict with keys for time_conv and resample
     """
-    b, t, h, w, c = x.shape
-
-    # Spatial downsample first (stride-2 conv per frame)
-    x = _wan_resample_downsample2d(x, weights, prefix)
-    mx.eval(x)
-
-    # Temporal downsample via CausalConv3d with stride (2,1,1)
-    time_conv_w = weights[f"{prefix}.time_conv.weight"]
-    time_conv_b = weights.get(f"{prefix}.time_conv.bias")
-    x = _conv3d_forward(x, time_conv_w, time_conv_b,
-                        stride=(2, 1, 1), padding=(1, 0, 0), causal=True)
-    mx.eval(x)
-
-    return x
+    # Only spatial downsample — temporal conv skipped in single-pass mode
+    return _wan_resample_downsample2d(x, weights, prefix)
 
 
 def _patchify_input(x: mx.array, patch_size: int = 2) -> mx.array:
