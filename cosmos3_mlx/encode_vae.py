@@ -2,7 +2,7 @@
 
 Implements the Wan2.2 encoder architecture (inverse of decoder):
 - Spatial patchification (pixel-space → patched input)
-- Down-blocks with strided convolutions for spatial/temporal downsampling
+- WanResidualDownBlock: resnets + downsample + AvgDown3D residual shortcut
 - Mid-block self-attention
 - quant_conv → mean extraction (argmax mode)
 - Per-channel normalization
@@ -70,18 +70,87 @@ def _wan_resample_downsample3d(x: mx.array, weights: dict, prefix: str) -> mx.ar
     return _wan_resample_downsample2d(x, weights, prefix)
 
 
+def _avg_down_3d(x: mx.array, in_channels: int, out_channels: int,
+                 factor_t: int, factor_s: int) -> mx.array:
+    """AvgDown3D: parameter-free channel-reshaping average-pool residual shortcut.
+
+    Matches HF's AvgDown3D exactly. Reshapes input by interleaving spatial/temporal
+    factors into channels, groups, and averages to produce the target channel count
+    at downsampled resolution.
+
+    Args:
+        x: [B, T, H, W, C] channels-last
+        in_channels: input channel count
+        out_channels: output channel count
+        factor_t: temporal downsampling factor (1 or 2)
+        factor_s: spatial downsampling factor (1 or 2)
+
+    Returns:
+        [B, T//factor_t, H//factor_s, W//factor_s, out_channels]
+    """
+    factor = factor_t * factor_s * factor_s
+    group_size = in_channels * factor // out_channels
+
+    b, t, h, w, c = x.shape
+
+    # Pad temporal if needed
+    pad_t = (factor_t - t % factor_t) % factor_t
+    if pad_t > 0:
+        x = mx.pad(x, [(0, 0), (pad_t, 0), (0, 0), (0, 0), (0, 0)])
+        t = t + pad_t
+
+    # HF layout is [B, C, T, H, W]. We work in [B, T, H, W, C].
+    # HF reshapes: [B, C, T//ft, ft, H//fs, fs, W//fs, fs]
+    # then permutes: [B, C, ft, fs, fs, T//ft, H//fs, W//fs]
+    # then views: [B, C*factor, T//ft, H//fs, W//fs]
+    # then views: [B, out_channels, group_size, T//ft, H//fs, W//fs]
+    # then means over group_size dim.
+    #
+    # In channels-last, the equivalent is:
+    # 1. Reshape to expose factors
+    # 2. Move factors next to channels
+    # 3. Reshape to [B, T', H', W', C*factor]
+    # 4. Reshape to [B, T', H', W', out_channels, group_size]
+    # 5. Mean over group_size
+
+    t_out = t // factor_t
+    h_out = h // factor_s
+    w_out = w // factor_s
+
+    # [B, T, H, W, C] -> [B, T//ft, ft, H//fs, fs, W//fs, fs, C]
+    x = x.reshape(b, t_out, factor_t, h_out, factor_s, w_out, factor_s, c)
+    # Move factors next to C: [B, T', H', W', C, ft, fs, fs]
+    x = mx.transpose(x, (0, 1, 3, 5, 7, 2, 4, 6))
+    # Collapse factors into channels: [B, T', H', W', C*factor]
+    x = x.reshape(b, t_out, h_out, w_out, c * factor)
+    # Group and average: [B, T', H', W', out_channels, group_size]
+    x = x.reshape(b, t_out, h_out, w_out, out_channels, group_size)
+    x = mx.mean(x, axis=-1)
+
+    return x
+
+
 def _patchify_input(x: mx.array, patch_size: int = 2) -> mx.array:
     """Patchify pixel-space input: pack spatial patches into channels.
 
     Input: [B, T, H, W, 3]
     Output: [B, T, H//p, W//p, 3*p*p]
+
+    Matches HF's patchify() exactly:
+    HF: [B,C,T,H,W] -> view [B,C,T,H//p,p,W//p,p] -> permute [B,C,p,p,T,H//p,W//p]
+        -> view [B, C*p*p, T, H//p, W//p]
+
+    In channels-last: [B,T,H,W,C] -> [B,T,H//p,p,W//p,p,C]
+        -> permute to [B,T,H//p,W//p,C,p,p] -> [B,T,H//p,W//p,C*p*p]
     """
     b, t, h, w, c = x.shape
     p = patch_size
     # [B, T, H, W, C] -> [B, T, H//p, p, W//p, p, C]
     x = x.reshape(b, t, h // p, p, w // p, p, c)
-    # Inverse of decoder's unpatchify transpose (0,1,2,6,3,5,4):
-    # [B, T, h, p2, w, p1, C] -> [B, T, h, w, C, p1, p2]
+    # HF permute is (0,1,6,4,2,3,5) on [B,C,T,H//p,p,W//p,p]
+    # which gives [B,C,p_w,p_h,T,H//p,W//p] — i.e. channel order is C,p_w,p_h
+    # In channels-last: [B,T,H//p,W//p,C,p_w,p_h]
+    # From [B,T,H//p,p_h,W//p,p_w,C] -> [B,T,H//p,W//p,C,p_w,p_h]
     x = mx.transpose(x, (0, 1, 2, 4, 6, 5, 3))
     x = x.reshape(b, t, h // p, w // p, c * p * p)
     return x
@@ -144,7 +213,8 @@ def encode_image(
 
     # Patchify: [1, 1, H, W, 3] -> [1, 1, H//2, W//2, 12]
     patch_size = config.get("patch_size", 2)
-    x = _patchify_input(x, patch_size)
+    if patch_size is not None and patch_size > 1:
+        x = _patchify_input(x, patch_size)
     print(f"    After patchify: {x.shape}")
 
     # conv_in
@@ -152,18 +222,25 @@ def encode_image(
     mx.eval(x)
     print(f"    After conv_in: {x.shape}")
 
-    # down_blocks
+    # Architecture config
+    is_residual = config.get("is_residual", False)
     temporal_downsample = config.get("temperal_downsample", [False, True, True])
+    dim_mult = config.get("dim_mult", [1, 2, 4, 4])
+    base_dim = config.get("base_dim", 160)
 
-    down_block_ids = set()
-    for k in weights:
-        if k.startswith("down_blocks."):
-            idx = int(k.split(".")[1])
-            down_block_ids.add(idx)
-    num_down_blocks = len(down_block_ids)
+    # Channel dimensions: [base_dim*1, base_dim*1, base_dim*2, base_dim*4, base_dim*4]
+    dims = [base_dim * u for u in [1] + dim_mult]
+
+    # down_blocks
+    num_down_blocks = len(dim_mult)
 
     for block_idx in range(num_down_blocks):
         prefix = f"down_blocks.{block_idx}"
+        in_dim = dims[block_idx]
+        out_dim = dims[block_idx + 1]
+
+        # Save input for residual shortcut (WanResidualDownBlock)
+        x_copy = x if is_residual else None
 
         # Count resnets
         resnet_ids = set()
@@ -179,7 +256,8 @@ def encode_image(
 
         # Downsampling if this block has a downsampler
         has_downsampler = any(k.startswith(f"{prefix}.downsampler.") for k in weights)
-        t_down = temporal_downsample[block_idx] if block_idx < len(temporal_downsample) else False
+        down_flag = block_idx != len(dim_mult) - 1
+        t_down = temporal_downsample[block_idx] if block_idx < len(temporal_downsample) and down_flag else False
 
         if has_downsampler:
             has_time_conv = f"{prefix}.downsampler.time_conv.weight" in weights
@@ -187,6 +265,14 @@ def encode_image(
                 x = _wan_resample_downsample3d(x, weights, f"{prefix}.downsampler")
             else:
                 x = _wan_resample_downsample2d(x, weights, f"{prefix}.downsampler")
+            mx.eval(x)
+
+        # AvgDown3D residual shortcut (WanResidualDownBlock)
+        if is_residual:
+            factor_t = 2 if t_down else 1
+            factor_s = 2 if down_flag else 1
+            shortcut = _avg_down_3d(x_copy, in_dim, out_dim, factor_t, factor_s)
+            x = x + shortcut
             mx.eval(x)
 
         print(f"    After down_block {block_idx}: {x.shape}")
