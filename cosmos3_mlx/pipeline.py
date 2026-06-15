@@ -415,6 +415,17 @@ class Cosmos3GenerationPipeline:
         cond_position_ids = None
         uncond_position_ids = None
 
+        # Compute noisy frame indexes for selective timestep embedding (i2v).
+        # For t2v (no conditioning): None = all frames get timestep.
+        # For i2v: exclude conditioned frames (frame 0).
+        noisy_fi = None
+        if has_image_condition:
+            cond_frame_set = set()
+            for fi in range(t_lat):
+                if vision_condition_mask[fi, 0, 0].item() > 0:
+                    cond_frame_set.add(fi)
+            noisy_fi = [fi for fi in range(t_lat) if fi not in cond_frame_set]
+
         for i in range(num_inference_steps):
             sigma = float(self.scheduler.sigmas[i].item())
 
@@ -433,9 +444,8 @@ class Cosmos3GenerationPipeline:
                     cond_ids, gen_tokens, t_tensor,
                     grid_t=t_lat, grid_h=h_p, grid_w=w_p,
                     audio_tokens=audio_tokens,
+                    noisy_frame_indexes=noisy_fi,
                 )
-                # Extract position_ids for cached forward (built inside diffusion_forward)
-                # We need to rebuild them here for the cached path
                 cond_text_len = cond_ids.shape[1]
                 cond_position_ids = self._build_position_ids(
                     cond_text_len, t_lat, h_p, w_p, audio_tokens,
@@ -448,6 +458,7 @@ class Cosmos3GenerationPipeline:
                     cond_position_ids, cond_ids.shape[1],
                     audio_tokens=audio_tokens,
                     grid_t=t_lat, grid_h=h_p, grid_w=w_p,
+                    noisy_frame_indexes=noisy_fi,
                 )
 
             # Classifier-free guidance
@@ -465,6 +476,7 @@ class Cosmos3GenerationPipeline:
                         uncond_ids, gen_tokens, t_tensor,
                         grid_t=t_lat, grid_h=h_p, grid_w=w_p,
                         audio_tokens=audio_tokens,
+                        noisy_frame_indexes=noisy_fi,
                     )
                     uncond_text_len = uncond_ids.shape[1]
                     uncond_position_ids = self._build_position_ids(

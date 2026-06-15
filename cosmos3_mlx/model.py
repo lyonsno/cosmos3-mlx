@@ -338,6 +338,7 @@ class Cosmos3Model(nn.Module):
         grid_h: int = 1,
         grid_w: int = 1,
         audio_tokens: Optional[mx.array] = None,
+        noisy_frame_indexes: Optional[list[int]] = None,
     ) -> mx.array | tuple[mx.array, mx.array]:
         """Forward pass for diffusion generation (one denoising step).
 
@@ -353,6 +354,9 @@ class Cosmos3Model(nn.Module):
             grid_h: height grid size (latent height / patch_size)
             grid_w: width grid size (latent width / patch_size)
             audio_tokens: optional [batch, sound_len, sound_dim] audio latents
+            noisy_frame_indexes: which temporal frames are noisy (get timestep
+                embedding). None = all frames are noisy (t2v default). For i2v
+                with frame 0 conditioned: [1, 2, 3, ...].
 
         Returns:
             If audio_tokens is None:
@@ -370,11 +374,26 @@ class Cosmos3Model(nn.Module):
         # Project generation tokens into hidden space
         gen_h = self.proj_in(gen_tokens)
 
-        # Add timestep embedding to generation tokens
-        # Reference applies timestep_scale=0.001 before sinusoidal encoding
+        # Add timestep embedding only to noisy frame tokens.
+        # HF Cosmos3OmniTransformer._apply_timestep_embeds_to_noisy_tokens uses
+        # scatter_add to selectively add timestep to noisy positions only.
+        # Conditioned frames (e.g. frame 0 in i2v) get no timestep signal.
         scaled_t = timestep * 0.001
         t_emb = self.time_embedder(scaled_t)  # [batch, hidden_size]
-        gen_h = gen_h + mx.expand_dims(t_emb, 1)
+
+        if noisy_frame_indexes is None:
+            # All frames noisy (t2v): add timestep to everything
+            gen_h = gen_h + mx.expand_dims(t_emb, 1)
+        else:
+            # Selective: build a mask for noisy token positions
+            spatial_tokens = grid_h * grid_w
+            noisy_mask = mx.zeros((num_patches,), dtype=gen_h.dtype)
+            for fi in noisy_frame_indexes:
+                start = fi * spatial_tokens
+                end = start + spatial_tokens
+                noisy_mask = noisy_mask.at[start:end].add(mx.ones((spatial_tokens,), dtype=gen_h.dtype))
+            # [1, num_patches, 1] mask * [1, 1, hidden_size] timestep
+            gen_h = gen_h + noisy_mask.reshape(1, num_patches, 1) * mx.expand_dims(t_emb, 1)
 
         # Build 3D mRoPE position IDs
         # Text tokens: all 3 axes share monotonically increasing IDs
@@ -467,6 +486,7 @@ class Cosmos3Model(nn.Module):
         grid_t: int = 1,
         grid_h: int = 1,
         grid_w: int = 1,
+        noisy_frame_indexes: Optional[list[int]] = None,
     ) -> mx.array | tuple[mx.array, mx.array]:
         """Cached diffusion forward — generation pathway only.
 
@@ -475,11 +495,21 @@ class Cosmos3Model(nn.Module):
         """
         num_patches = gen_tokens.shape[1]
 
-        # Project generation tokens + timestep embedding
+        # Project generation tokens + selective timestep embedding
         gen_h = self.proj_in(gen_tokens)
         scaled_t = timestep * 0.001
         t_emb = self.time_embedder(scaled_t)
-        gen_h = gen_h + mx.expand_dims(t_emb, 1)
+
+        if noisy_frame_indexes is None:
+            gen_h = gen_h + mx.expand_dims(t_emb, 1)
+        else:
+            spatial_tokens = grid_h * grid_w
+            noisy_mask = mx.zeros((num_patches,), dtype=gen_h.dtype)
+            for fi in noisy_frame_indexes:
+                start = fi * spatial_tokens
+                end = start + spatial_tokens
+                noisy_mask = noisy_mask.at[start:end].add(mx.ones((spatial_tokens,), dtype=gen_h.dtype))
+            gen_h = gen_h + noisy_mask.reshape(1, num_patches, 1) * mx.expand_dims(t_emb, 1)
 
         # Handle audio tokens
         if audio_tokens is not None:
