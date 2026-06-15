@@ -2,7 +2,7 @@
 
 Wires the MoT transformer (generation path), scheduler, timestep
 embedding, video VAE decoder, and audio decoder into a complete
-text-to-image/video generation flow.
+text-to-image/video and image-to-video generation flow.
 """
 
 import json
@@ -11,7 +11,7 @@ import tempfile
 import time
 import wave
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -53,6 +53,7 @@ class Cosmos3GenerationPipeline:
         self.audio_decoder = audio_decoder
         self.vae_config = vae_config or VAEConfig()
         self.scheduler = UniPCScheduler()
+        self._model_dir = Path(model_dir) if model_dir is not None else None
 
         # Load reference negative prompt if available
         self._negative_prompt_text = None
@@ -185,6 +186,60 @@ class Cosmos3GenerationPipeline:
 
         return x
 
+    def _encode_conditioning_image(
+        self,
+        image: np.ndarray,
+        num_frames: int,
+        height: int,
+        width: int,
+    ) -> mx.array:
+        """Encode a conditioning image to normalized VAE latents.
+
+        Matches HF Cosmos3OmniPipeline: for i2v, the conditioning frame is
+        repeat-padded across all temporal positions before encoding (the VAE
+        uses causal convolutions that need real content at all positions).
+
+        Args:
+            image: [H, W, 3] uint8 or float32 in [0, 1]
+            num_frames: total video frames
+            height: target height
+            width: target width
+
+        Returns:
+            [1, T_lat, H_lat, W_lat, z_dim] normalized latents (channels-last)
+        """
+        from .encode_vae import encode_image
+
+        vae_dir = str(self._model_dir / "vae")
+
+        # Resize image to target resolution
+        from PIL import Image as PILImage
+        if isinstance(image, np.ndarray):
+            pil_img = PILImage.fromarray(
+                (image * 255).astype(np.uint8) if image.dtype == np.float32 else image
+            )
+        else:
+            pil_img = image
+        pil_img = pil_img.resize((width, height), PILImage.LANCZOS)
+        image_np = np.array(pil_img).astype(np.float32) / 255.0
+
+        if num_frames == 1:
+            # Single image: encode directly
+            return encode_image(image_np, vae_dir)
+
+        # For video: repeat-pad the conditioning frame across all temporal positions.
+        # HF does: vision_tensor[:, :, 0] = frame; vision_tensor[:, :, 1:] = frame.repeat()
+        # Then encodes the full [1, 3, T, H, W] through the VAE.
+        # Since our encoder only handles single images right now, we encode just frame 0
+        # and tile the latent across the temporal dimension. This is equivalent because
+        # the VAE encoder with single-pass mode skips temporal convolutions (no causal
+        # conv cache), so encoding T copies of the same frame produces T copies of the
+        # same latent.
+        single_latent = encode_image(image_np, vae_dir)  # [1, 1, H_lat, W_lat, z_dim]
+        mx.eval(single_latent)
+        t_lat = max(1, num_frames // 4)
+        return mx.repeat(single_latent, t_lat, axis=1)  # [1, T_lat, H_lat, W_lat, z_dim]
+
     def generate(
         self,
         prompt: str,
@@ -195,8 +250,9 @@ class Cosmos3GenerationPipeline:
         guidance_scale: float = 6.0,
         seed: Optional[int] = None,
         enable_audio: bool = False,
+        image: Optional[Union[np.ndarray, "PILImage"]] = None,
     ) -> dict:
-        """Generate image/video from text prompt, optionally with audio.
+        """Generate image/video from text prompt, optionally conditioned on an image.
 
         Args:
             prompt: text description
@@ -207,6 +263,9 @@ class Cosmos3GenerationPipeline:
             guidance_scale: classifier-free guidance strength
             seed: random seed for reproducibility
             enable_audio: whether to generate audio alongside video
+            image: optional conditioning image for i2v. When provided, frame 0
+                is anchored to this image and the remaining frames are denoised
+                freely. Can be numpy array [H,W,3] (uint8 or float32) or PIL Image.
 
         Returns:
             dict with 'latents', 'video' (if VAE available),
@@ -216,6 +275,8 @@ class Cosmos3GenerationPipeline:
             mx.random.seed(seed)
 
         dtype = mx.bfloat16
+
+        has_image_condition = image is not None and num_frames > 1
 
         # 1. Tokenize prompt
         is_image = (num_frames == 1)
@@ -274,6 +335,27 @@ class Cosmos3GenerationPipeline:
         t_lat = latents.shape[1]
         h_lat = latents.shape[2]
         w_lat = latents.shape[3]
+
+        # 2a. Image-to-video conditioning: encode image, create mask, mix
+        # Vision condition mask: [T_lat, 1, 1] — 1.0 for conditioned frames, 0.0 for noisy
+        vision_condition_mask = mx.zeros((t_lat, 1, 1))
+        if has_image_condition:
+            print("  Encoding conditioning image...")
+            cond_latents = self._encode_conditioning_image(
+                image, num_frames, height, width
+            ).astype(dtype)
+            mx.eval(cond_latents)
+            print(f"  Condition latents: {cond_latents.shape}, "
+                  f"mean={mx.mean(cond_latents).item():.3f}, std={mx.std(cond_latents).item():.3f}")
+
+            # Frame 0 is conditioned
+            vision_condition_mask = vision_condition_mask.at[0, 0, 0].add(mx.array(1.0))
+
+            # Mix: conditioned frames get encoded latent, rest get noise
+            # cond_latents is [1, T_lat, H_lat, W_lat, z_dim], mask broadcasts over spatial+channel
+            mask_5d = vision_condition_mask.reshape(1, t_lat, 1, 1, 1)
+            latents = mask_5d * cond_latents + (1.0 - mask_5d) * latents
+            mx.eval(latents)
 
         # Patchify: [1, T_lat, H_lat, W_lat, z_dim] -> [1, num_patches, patch_dim]
         p = self.vae_config.patch_size
@@ -400,6 +482,13 @@ class Cosmos3GenerationPipeline:
             velocity = self._unpatchify_latents(
                 velocity_patches, t_lat, h_p, w_p
             )
+
+            # Zero velocity at conditioned frame positions (i2v).
+            # With flow-matching: x_{t-1} = x_t + step * velocity.
+            # Zeroing velocity keeps conditioned frames fixed at their initial value.
+            if has_image_condition:
+                mask_5d = vision_condition_mask.reshape(1, t_lat, 1, 1, 1)
+                velocity = velocity * (1.0 - mask_5d)
 
             # Scheduler step (uses internal step_index)
             latents = self.scheduler.step(velocity, t_tensor, latents)
