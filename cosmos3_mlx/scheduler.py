@@ -10,6 +10,10 @@ Key formulas (flow matching path):
 - x_t = alpha_t * x_0 + sigma_t * noise
 - Model predicts velocity v, x_0 recovered as: x_0 = x_t - sigma_t * v
 - Stepping uses log-SNR (lambda) space exponential integrators
+
+The full UniPC algorithm runs a predictor (P) step followed by a corrector (C)
+step at each iteration. The corrector uses the current model output to refine
+the sample predicted by the previous predictor step.
 """
 
 from typing import Optional
@@ -27,6 +31,7 @@ class UniPCScheduler:
     - predict_x0: True
     - solver_order: 2
     - solver_type: bh2
+    - lower_order_final: True
     """
 
     def __init__(
@@ -37,6 +42,7 @@ class UniPCScheduler:
         use_karras_sigmas: bool = True,
         sigma_min: float = 0.147,
         sigma_max: float = 200.0,
+        lower_order_final: bool = True,
     ):
         self.num_train_timesteps = num_train_timesteps
         self.flow_shift = flow_shift
@@ -44,10 +50,15 @@ class UniPCScheduler:
         self.use_karras_sigmas = use_karras_sigmas
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
+        self.lower_order_final = lower_order_final
 
         self.sigmas = None
         self.timesteps = None
-        self.model_outputs = []  # History for multistep
+        self.model_outputs = [None] * solver_order
+        self.timestep_list = [None] * solver_order
+        self.lower_order_nums = 0
+        self.last_sample = None
+        self.this_order = None
         self.step_index = 0
 
     def set_timesteps(self, num_inference_steps: int):
@@ -59,173 +70,219 @@ class UniPCScheduler:
         self.num_inference_steps = num_inference_steps
 
         if self.use_karras_sigmas:
-            # Karras sigma schedule: concentrate steps at lower noise for detail
-            # rho=7 is the standard Karras value
             rho = 7.0
             ramp = np.linspace(0, 1, num_inference_steps)
             min_inv_rho = self.sigma_min ** (1 / rho)
             max_inv_rho = self.sigma_max ** (1 / rho)
             karras_sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
-
-            # Convert Karras sigmas to flow-matching space: σ_flow = σ / (σ + 1)
             sigmas = karras_sigmas / (karras_sigmas + 1)
         else:
-            # Flow sigmas: linear from 1 to near-zero
             sigmas = np.linspace(1, 1 / self.num_train_timesteps, num_inference_steps + 1)[:-1]
-
-            # Apply flow shift
             if self.flow_shift != 1.0:
                 sigmas = self.flow_shift * sigmas / (1 + (self.flow_shift - 1) * sigmas)
 
-        # Ensure sigma[0] is not exactly 1.0 (causes log(0) in lambda)
         eps = 1e-6
         if abs(sigmas[0] - 1.0) < eps:
             sigmas[0] -= eps
 
-        # Append terminal sigma = 0
         sigmas = np.append(sigmas, 0.0)
 
         self.sigmas = mx.array(sigmas.astype(np.float32))
         self.timesteps = mx.array((sigmas[:-1] * self.num_train_timesteps).astype(np.float32))
 
         # Reset state
-        self.model_outputs = []
+        self.model_outputs = [None] * self.solver_order
+        self.timestep_list = [None] * self.solver_order
+        self.lower_order_nums = 0
+        self.last_sample = None
+        self.this_order = None
         self.step_index = 0
 
-    def _convert_to_x0(
-        self,
-        model_output: mx.array,
-        sigma: float,
-        sample: mx.array,
-    ) -> mx.array:
-        """Convert flow prediction to x0 prediction.
-
-        For flow matching: x_0 = x_t - sigma_t * v_predicted
-        """
+    def _convert_model_output(self, model_output: mx.array, sample: mx.array) -> mx.array:
+        """Convert flow velocity prediction to x0 prediction."""
+        sigma = float(self.sigmas[self.step_index].item())
         return sample - sigma * model_output
+
+    def _compute_rks_and_D1s(self, order: int, h: float, lambda_s0: float,
+                             m0: mx.array, step_offset: int = 0):
+        """Compute rk ratios and D1 differences for multistep methods."""
+        rks = []
+        D1s = []
+        for i in range(1, order):
+            si = self.step_index - i - step_offset
+            mi = self.model_outputs[-(i + 1)]
+            if mi is None:
+                break
+            sigma_si = float(self.sigmas[si].item())
+            alpha_si = 1.0 - sigma_si
+            lambda_si = np.log(alpha_si / max(sigma_si, 1e-10))
+            rk = (lambda_si - lambda_s0) / h
+            rks.append(rk)
+            D1s.append((mi - m0) / rk)
+        return rks, D1s
+
+    def _compute_bh2_coefficients(self, h: float, order: int):
+        """Compute R matrix and b vector for BH2 solver."""
+        hh = -h  # predict_x0 mode
+        h_phi_1 = np.expm1(hh)
+        h_phi_k = h_phi_1 / hh - 1
+        factorial_i = 1
+        B_h = np.expm1(hh)
+
+        b = []
+        for i in range(1, order + 1):
+            b.append(float(h_phi_k * factorial_i / B_h))
+            factorial_i *= i + 1
+            h_phi_k = h_phi_k / hh - 1 / factorial_i
+
+        return h_phi_1, B_h, b
+
+    def _uni_p_bh_update(self, sample: mx.array, order: int) -> mx.array:
+        """UniP predictor step (B(h) version).
+
+        Predicts x_{t+1} from x_t using stored model outputs (x0 predictions).
+        """
+        m0 = self.model_outputs[-1]
+
+        sigma_t = float(self.sigmas[self.step_index + 1].item())
+        sigma_s0 = float(self.sigmas[self.step_index].item())
+        alpha_t = 1.0 - sigma_t
+        alpha_s0 = 1.0 - sigma_s0
+
+        if sigma_t == 0.0:
+            return m0
+
+        lambda_t = np.log(max(alpha_t, 1e-10) / max(sigma_t, 1e-10))
+        lambda_s0 = np.log(alpha_s0 / max(sigma_s0, 1e-10))
+        h = lambda_t - lambda_s0
+
+        h_phi_1, B_h, b = self._compute_bh2_coefficients(h, order)
+
+        # First-order base step
+        x_t_ = (sigma_t / sigma_s0) * sample - alpha_t * h_phi_1 * m0
+
+        if order == 1 or self.model_outputs[-2] is None:
+            return x_t_
+
+        rks, D1s = self._compute_rks_and_D1s(order, h, lambda_s0, m0)
+        if not D1s:
+            return x_t_
+
+        # For order 2, HF hardcodes rho_p = 0.5
+        rho_p = 0.5
+        pred_res = rho_p * D1s[0]
+
+        x_t = x_t_ - alpha_t * B_h * pred_res
+        return x_t
+
+    def _uni_c_bh_update(
+        self, this_model_output: mx.array, last_sample: mx.array,
+        this_sample: mx.array, order: int,
+    ) -> mx.array:
+        """UniC corrector step (B(h) version).
+
+        Corrects the predictor output using the model evaluation at the predicted point.
+        """
+        m0 = self.model_outputs[-1]
+
+        sigma_t = float(self.sigmas[self.step_index].item())
+        sigma_s0 = float(self.sigmas[self.step_index - 1].item())
+        alpha_t = 1.0 - sigma_t
+        alpha_s0 = 1.0 - sigma_s0
+
+        lambda_t = np.log(max(alpha_t, 1e-10) / max(sigma_t, 1e-10))
+        lambda_s0 = np.log(alpha_s0 / max(sigma_s0, 1e-10))
+        h = lambda_t - lambda_s0
+
+        h_phi_1, B_h, b_list = self._compute_bh2_coefficients(h, order)
+
+        # Base step using last_sample (the sample before the predictor)
+        x_t_ = (sigma_t / sigma_s0) * last_sample - alpha_t * h_phi_1 * m0
+
+        # Compute rks and D1s from history (offset by 1 for corrector indexing)
+        rks, D1s = self._compute_rks_and_D1s(order, h, lambda_s0, m0, step_offset=1)
+
+        # Build R matrix and solve for rhos_c
+        # rks_full includes the historical rks plus a trailing 1.0
+        rks_np = np.array([rk for rk in rks] + [1.0])
+
+        R = np.stack([np.power(rks_np, i) for i in range(order)])  # [order, order]
+        b = np.array(b_list[:order])
+
+        if order == 1:
+            rhos_c = np.array([0.5])
+        else:
+            rhos_c = np.linalg.solve(R, b)
+
+        # Apply correction
+        D1_t = this_model_output - m0
+        if D1s:
+            corr_res = sum(rhos_c[k] * D1s[k] for k in range(len(D1s)))
+        else:
+            corr_res = 0
+        x_t = x_t_ - alpha_t * B_h * (corr_res + rhos_c[-1] * D1_t)
+        return x_t
 
     def step(
         self,
         model_output: mx.array,
         timestep: mx.array,
         sample: mx.array,
-        next_timestep: Optional[mx.array] = None,
     ) -> mx.array:
-        """Perform one denoising step using UniPC.
+        """Perform one denoising step using UniPC predictor-corrector.
 
-        Args:
-            model_output: predicted velocity from the transformer
-            timestep: current timestep (unused, we use step_index)
-            sample: current noisy sample x_t
-            next_timestep: unused (we use step_index)
-
-        Returns:
-            denoised sample x_{t-1}
+        Matches HF UniPCMultistepScheduler.step() exactly:
+        1. Convert model output to x0 prediction
+        2. Corrector step (refine previous predictor output using current model eval)
+        3. Update history
+        4. Predictor step (predict next sample)
         """
-        sigma_s = float(self.sigmas[self.step_index].item())
-        sigma_t = float(self.sigmas[self.step_index + 1].item())
-
         # Convert model output to x0 prediction
-        x0_pred = self._convert_to_x0(model_output, sigma_s, sample)
+        model_output_x0 = self._convert_model_output(model_output, sample)
 
-        # Store for multistep
-        self.model_outputs.append(x0_pred)
-        if len(self.model_outputs) > self.solver_order:
-            self.model_outputs.pop(0)
-
-        # Compute alpha and sigma for source and target
-        alpha_s = 1.0 - sigma_s
-        alpha_t = 1.0 - sigma_t
-
-        if sigma_t == 0.0:
-            # Final step: just return x0
-            result = x0_pred
-        elif len(self.model_outputs) == 1 or self.solver_order == 1:
-            # First-order step (or order-1 mode)
-            result = self._first_order_step(
-                x0_pred, sample, sigma_s, sigma_t, alpha_s, alpha_t
+        # Corrector step: refine the current sample using the new model output
+        use_corrector = (
+            self.step_index > 0
+            and self.last_sample is not None
+        )
+        if use_corrector:
+            sample = self._uni_c_bh_update(
+                this_model_output=model_output_x0,
+                last_sample=self.last_sample,
+                this_sample=sample,
+                order=self.this_order,
             )
+
+        # Shift history buffers
+        for i in range(self.solver_order - 1):
+            self.model_outputs[i] = self.model_outputs[i + 1]
+            self.timestep_list[i] = self.timestep_list[i + 1]
+
+        self.model_outputs[-1] = model_output_x0
+        self.timestep_list[-1] = float(timestep.item()) if hasattr(timestep, 'item') else float(timestep)
+
+        # Determine effective order for this step
+        if self.lower_order_final:
+            this_order = min(self.solver_order, len(self.timesteps) - self.step_index)
         else:
-            # Second-order multistep
-            result = self._second_order_step(
-                self.model_outputs, sample, sigma_s, sigma_t, alpha_s, alpha_t
-            )
+            this_order = self.solver_order
+
+        # Warmup: don't use higher order until we have enough history
+        this_order = min(this_order, self.lower_order_nums + 1)
+        assert this_order > 0
+        self.this_order = this_order
+
+        # Save sample for next corrector step
+        self.last_sample = sample
+
+        # Predictor step
+        prev_sample = self._uni_p_bh_update(sample=sample, order=this_order)
+
+        if self.lower_order_nums < self.solver_order:
+            self.lower_order_nums += 1
 
         self.step_index += 1
-        return result
-
-    def _first_order_step(
-        self,
-        x0_pred: mx.array,
-        sample: mx.array,
-        sigma_s: float,
-        sigma_t: float,
-        alpha_s: float,
-        alpha_t: float,
-    ) -> mx.array:
-        """First-order UniPC step in log-SNR space.
-
-        lambda = log(alpha/sigma)
-        h = lambda_t - lambda_s
-        x_t = (sigma_t/sigma_s) * x_s - alpha_t * (e^(-h) - 1) * x0_pred
-        """
-        # Log-SNR values
-        lambda_s = np.log(alpha_s / max(sigma_s, 1e-10))
-        lambda_t = np.log(max(alpha_t, 1e-10) / max(sigma_t, 1e-10))
-        h = lambda_t - lambda_s
-
-        # For predict_x0 with bh2 solver:
-        # x_t = (sigma_t / sigma_s) * x_s - alpha_t * (exp(-h) - 1) * x0
-        h_phi_1 = np.expm1(-h)  # e^(-h) - 1
-
-        x_t = (sigma_t / sigma_s) * sample - alpha_t * h_phi_1 * x0_pred
-        return x_t
-
-    def _second_order_step(
-        self,
-        model_outputs: list,
-        sample: mx.array,
-        sigma_s: float,
-        sigma_t: float,
-        alpha_s: float,
-        alpha_t: float,
-    ) -> mx.array:
-        """Second-order UniPC multistep in log-SNR space.
-
-        Uses the previous x0 prediction to compute a correction term.
-        """
-        m0 = model_outputs[-1]  # Latest x0 prediction
-        m_prev = model_outputs[-2]  # Previous x0 prediction
-
-        # Get previous sigma for the D1 coefficient
-        prev_step = max(0, self.step_index - 1)
-        sigma_prev = float(self.sigmas[prev_step].item())
-        alpha_prev = 1.0 - sigma_prev
-
-        # Log-SNR values
-        lambda_s = np.log(alpha_s / max(sigma_s, 1e-10))
-        lambda_t = np.log(max(alpha_t, 1e-10) / max(sigma_t, 1e-10))
-        lambda_prev = np.log(alpha_prev / max(sigma_prev, 1e-10))
-
-        h = lambda_t - lambda_s
-        h_prev = lambda_s - lambda_prev
-        r = h_prev / h if abs(h) > 1e-10 else 0.0
-
-        # First-order base
-        h_phi_1 = np.expm1(-h)
-        x_t_ = (sigma_t / sigma_s) * sample - alpha_t * h_phi_1 * m0
-
-        # Second-order correction: D1 = (m0 - m_prev), weighted by r
-        # For bh2 solver: B_h = expm1(-h)
-        B_h = np.expm1(-h)
-
-        # rho coefficient for second order
-        rho = 1.0 / (2.0 * r) if abs(r) > 1e-10 else 0.0
-
-        D1 = m0 - m_prev
-        x_t = x_t_ - alpha_t * B_h * rho * D1
-
-        return x_t
+        return prev_sample
 
     def add_noise(
         self,
