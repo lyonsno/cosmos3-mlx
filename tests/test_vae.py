@@ -1,11 +1,19 @@
-"""Tests for the Wan2.2 VAE decoder."""
+"""Tests for the Wan2.2 VAE decoder and encoder."""
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from cosmos3_mlx.vae import VAEConfig, WanDecoder, WanResidualBlock, WanRMSNorm, dup_up_3d
 from cosmos3_mlx.decode_vae import (
     _conv3d_forward, _transpose_conv3d_weight, decode_latents,
+)
+from cosmos3_mlx.encode_vae import (
+    _conv3d_forward_cached,
+    _encoder_forward,
+    _count_encoder_cache_slots,
+    _patchify_input,
+    CACHE_T,
 )
 
 
@@ -224,3 +232,89 @@ class TestPostQuantConv:
         # W swaps channels 1 and 2
         expected = mx.array([[[[[1.0, 3.0, 2.0, 4.0]]]]])
         assert mx.allclose(out, expected, atol=1e-5).item()
+
+
+class TestConv3dForwardCached:
+    """Test cached conv3d matches uncached for single-frame input."""
+
+    def test_single_frame_cached_matches_uncached(self):
+        """First-chunk cached conv should produce same result as uncached."""
+        mx.random.seed(42)
+        weight = mx.random.normal((16, 3, 3, 3, 8)) * 0.1
+        bias = mx.zeros((16,))
+        x = mx.random.normal((1, 1, 4, 4, 8))
+        mx.eval(weight, bias, x)
+
+        # Uncached
+        out_uncached = _conv3d_forward(x, weight, bias, stride=(1, 1, 1), padding=(1, 1, 1))
+        mx.eval(out_uncached)
+
+        # Cached (first chunk, no prior cache)
+        feat_cache = [None]
+        feat_idx = [0]
+        out_cached = _conv3d_forward_cached(
+            x, weight, bias, feat_cache, feat_idx,
+            stride=(1, 1, 1), padding=(1, 1, 1),
+        )
+        mx.eval(out_cached)
+
+        assert out_cached.shape == out_uncached.shape
+        assert mx.allclose(out_cached, out_uncached, atol=1e-5).item(), \
+            f"Max diff: {mx.max(mx.abs(out_cached - out_uncached)).item()}"
+        assert feat_idx[0] == 1
+        assert feat_cache[0] is not None
+
+    def test_cache_preserves_temporal_context(self):
+        """Two sequential single-frame chunks should use cache for temporal continuity."""
+        mx.random.seed(42)
+        weight = mx.random.normal((8, 3, 3, 3, 8)) * 0.1
+        bias = mx.zeros((8,))
+        # 2 frames
+        x_full = mx.random.normal((1, 2, 4, 4, 8))
+        mx.eval(weight, bias, x_full)
+
+        # Full pass (uncached)
+        out_full = _conv3d_forward(x_full, weight, bias)
+        mx.eval(out_full)
+
+        # Chunked: frame 0, then frame 1
+        feat_cache = [None]
+        feat_idx = [0]
+
+        feat_idx[0] = 0
+        out0 = _conv3d_forward_cached(
+            x_full[:, :1], weight, bias, feat_cache, feat_idx,
+        )
+        mx.eval(out0)
+
+        feat_idx[0] = 0
+        out1 = _conv3d_forward_cached(
+            x_full[:, 1:], weight, bias, feat_cache, feat_idx,
+        )
+        mx.eval(out1)
+
+        out_chunked = mx.concatenate([out0, out1], axis=1)
+        mx.eval(out_chunked)
+
+        assert out_chunked.shape == out_full.shape
+        assert mx.allclose(out_chunked, out_full, atol=1e-5).item(), \
+            f"Max diff: {mx.max(mx.abs(out_chunked - out_full)).item()}"
+
+
+class TestCountEncoderCacheSlots:
+    """Test cache slot counting."""
+
+    def test_cosmos3_nano_config(self):
+        """Count should be reasonable for Cosmos3-Nano config."""
+        config = {
+            "is_residual": True,
+            "dim_mult": [1, 2, 4, 4],
+            "num_res_blocks": 2,
+            "temperal_downsample": [False, True, True],
+            "base_dim": 160,
+        }
+        count = _count_encoder_cache_slots({}, config)
+        # conv_in(1) + 4 blocks × resnets + shortcuts + time_convs + mid(4) + conv_out(1)
+        # Must be positive and reasonable
+        assert count > 10
+        assert count < 50

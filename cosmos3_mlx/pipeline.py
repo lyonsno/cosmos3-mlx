@@ -486,6 +486,7 @@ class Cosmos3GenerationPipeline:
                         gen_tokens, t_tensor, uncond_kv_cache,
                         uncond_position_ids, uncond_ids.shape[1],
                         audio_tokens=audio_tokens,
+                        noisy_frame_indexes=noisy_fi,
                         grid_t=t_lat, grid_h=h_p, grid_w=w_p,
                     )
 
