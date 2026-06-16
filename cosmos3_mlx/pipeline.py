@@ -90,6 +90,9 @@ class Cosmos3GenerationPipeline:
         text_position_ids = mx.stack([text_pos, text_pos, text_pos])
 
         # Generation positions (FPS-modulated)
+        # Large temporal margin separates text and vision in mRoPE space.
+        # HF pipeline chains text_mrope → vision_mrope with offset = text_len,
+        # but the model may have been trained with a larger separation.
         temporal_margin = 15000
         temporal_offset = float(text_len + temporal_margin)
         fps = 25.0
@@ -155,22 +158,28 @@ class Cosmos3GenerationPipeline:
         With patch_size=2: each 2x2 spatial region becomes one token.
         patch_latent_dim = z_dim * patch_size * patch_size = 48 * 4 = 192
 
-        If H or W are not divisible by patch_size, truncates to the largest
-        multiple (drops the last row/col). This matches the proven generation
-        behavior at 720p (h_lat=45 → h_p=22, dropping 1 latent row).
+        If H or W are not divisible by patch_size, zero-pads to the next
+        multiple (matching HF's _patchify_and_pack_latents). The padding
+        only exists during the transformer forward; _unpatchify_latents
+        crops back to original dims.
         """
         batch, t, h, w, z = latents.shape
         p = self.vae_config.patch_size
 
-        h_p = h // p
-        w_p = w // p
-        # Truncate if needed
-        h_used = h_p * p
-        w_used = w_p * p
-        if h_used != h or w_used != w:
-            latents = latents[:, :, :h_used, :w_used, :]
+        h_p = (h + p - 1) // p  # ceil division
+        w_p = (w + p - 1) // p
+        h_padded = h_p * p
+        w_padded = w_p * p
 
-        # [B, T, H//p, p, W//p, p, z] -> [B, T*H_p*W_p, p*p*z]
+        # Zero-pad if needed (use concatenation, not .at[].add())
+        if h_padded != h:
+            pad_h = mx.zeros((batch, t, h_padded - h, w, z), dtype=latents.dtype)
+            latents = mx.concatenate([latents, pad_h], axis=2)
+        if w_padded != w:
+            pad_w = mx.zeros((batch, t, latents.shape[2], w_padded - w, z), dtype=latents.dtype)
+            latents = mx.concatenate([latents, pad_w], axis=3)
+
+        # [B, T, H_pad//p, p, W_pad//p, p, z] -> [B, T*H_p*W_p, p*p*z]
         x = latents.reshape(batch, t, h_p, p, w_p, p, z)
         x = mx.transpose(x, (0, 1, 2, 4, 3, 5, 6))  # [B, T, H_p, W_p, p, p, z]
         x = x.reshape(batch, t * h_p * w_p, p * p * z)
@@ -184,7 +193,9 @@ class Cosmos3GenerationPipeline:
         """Convert patch tokens back to VAE latent shape.
 
         Input: [batch, num_patches, patch_latent_dim]
-        Output: [batch, T, H, W, z_dim]
+        Output: [batch, T, H_orig, W_orig, z_dim]
+
+        Crops padded dimensions back to h_orig × w_orig when provided.
         """
         batch = tokens.shape[0]
         p = self.vae_config.patch_size
@@ -193,6 +204,10 @@ class Cosmos3GenerationPipeline:
         x = tokens.reshape(batch, t, h_p, w_p, p, p, z)
         x = mx.transpose(x, (0, 1, 2, 4, 3, 5, 6))  # [B, T, H_p, p, W_p, p, z]
         x = x.reshape(batch, t, h_p * p, w_p * p, z)
+
+        # Crop back to original dims (remove padding)
+        if h_orig > 0 and w_orig > 0:
+            x = x[:, :, :h_orig, :w_orig, :]
 
         return x
 
@@ -344,14 +359,13 @@ class Cosmos3GenerationPipeline:
         h_lat = latents.shape[2]
         w_lat = latents.shape[3]
 
-        # Truncate latent spatial dims to be divisible by patch_size.
-        # E.g. 720p: h_lat=45 → 44, losing 1 latent row (16 pixels).
-        # Output video will be h_lat*16 × w_lat*16 after VAE decode.
+        # Patchify grid: ceil division to match HF's zero-padding patchify.
+        # Latents stay at original h_lat × w_lat between denoising steps.
+        # Padding to patch-aligned dims only happens inside _patchify_latents,
+        # and _unpatchify_latents crops back to h_lat × w_lat.
         p = self.vae_config.patch_size
-        h_lat = (h_lat // p) * p
-        w_lat = (w_lat // p) * p
-        if h_lat != latents.shape[2] or w_lat != latents.shape[3]:
-            latents = latents[:, :, :h_lat, :w_lat, :]
+        h_p = (h_lat + p - 1) // p  # ceil: 45→23 at 720p
+        w_p = (w_lat + p - 1) // p
 
         # 2a. Image-to-video conditioning: encode image, create mask, mix
         # Vision condition mask: [T_lat, 1, 1] — 1.0 for conditioned frames, 0.0 for noisy
@@ -361,7 +375,7 @@ class Cosmos3GenerationPipeline:
             cond_latents = self._encode_conditioning_image(
                 image, num_frames, height, width
             ).astype(dtype)
-            # Truncate to match noise latent dimensions
+            # Crop to match noise latent temporal/spatial dims
             cond_latents = cond_latents[:, :t_lat, :h_lat, :w_lat, :]
             mx.eval(cond_latents)
             print(f"  Condition latents: {cond_latents.shape}, "
@@ -376,9 +390,6 @@ class Cosmos3GenerationPipeline:
             latents = mask_5d * cond_latents + (1.0 - mask_5d) * latents
             mx.eval(latents)
 
-        # Patchify grid (h_lat/w_lat already truncated to multiples of p above)
-        h_p = h_lat // p
-        w_p = w_lat // p
         num_patches = t_lat * h_p * w_p
 
         # 2b. Prepare audio noise latents if enabled
@@ -509,9 +520,10 @@ class Cosmos3GenerationPipeline:
                 else:
                     velocity_patches = cond_result
 
-            # Unpatchify velocity back to latent shape
+            # Unpatchify velocity back to latent shape, crop to original dims
             velocity = self._unpatchify_latents(
                 velocity_patches, t_lat, h_p, w_p,
+                h_orig=h_lat, w_orig=w_lat,
             )
 
             # Zero velocity at conditioned frame positions (i2v).
