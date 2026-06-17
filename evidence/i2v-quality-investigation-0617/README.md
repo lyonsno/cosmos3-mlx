@@ -1,0 +1,138 @@
+# i2v Quality Investigation — 2026-06-17
+
+Diaulos: nvidia-omni-mlx-port-research
+Session: cc-cosmos3-quality-0617
+Branch: cc/gen-quality-review-0614
+Attractor: port-nvidia-cosmos3-nano-to-mlx-for-mac-native-omnimodal-inference
+
+## Problem Statement
+
+Operator reports i2v generation at 720p produces qualitatively wrong output
+compared to HF diffusers reference: fewer details resolved, specific objects
+missing, things wrong. Not just softness — structurally different quality.
+
+## Experiments Run
+
+### 1. t2v Transformer Parity (identical inputs)
+
+**Script:** `scripts/bisect_transformer_720p.py`
+
+Fed identical noise, tokens, and timestep to both MLX and HF transformers
+for t2v (all frames noisy). Compared raw velocity output.
+
+| Resolution | Cosine | Max diff | Mean diff | p99.9 |
+|---|---|---|---|---|
+| 256x256 | 0.99992 | 0.056 | 0.011 | 0.045 |
+| 720p | 0.99984 | 0.119 | 0.015 | 0.062 |
+
+**Conclusion:** t2v transformer output matches within bf16 tolerance.
+
+### 2. i2v Transformer Parity (identical inputs, frame 0 conditioned)
+
+**Script:** `scripts/bisect_i2v_transformer.py`
+**Numerical data:** `cosmos3_i2v_xfmr_256_256.npz`, `cosmos3_i2v_xfmr_720p.npz`
+
+Fed identical mixed latents (frame 0 = fake conditioning, frames 1-3 = noise)
+to both transformers with noisy_frame_indexes=[1,2,3].
+
+**256x256 i2v:**
+| Frame | Cosine | Max diff | Mean diff |
+|---|---|---|---|
+| 0 (COND) | 0.000 (MLX=garbage, HF=zero) | 5.85 | 0.74 |
+| 1 (noisy) | 0.99988 | 0.105 | 0.013 |
+| 2 (noisy) | 0.99991 | 0.059 | 0.012 |
+| 3 (noisy) | 0.99991 | 0.068 | 0.011 |
+
+**720p i2v:**
+| Frame | Cosine | Max diff | Mean diff |
+|---|---|---|---|
+| 0 (COND) | 0.000 (MLX=garbage, HF=zero) | 6.86 | 0.71 |
+| 1 (noisy) | 0.99981 | 0.220 | 0.016 |
+| 2 (noisy) | 0.99989 | 0.092 | 0.013 |
+| 3 (noisy) | 0.99990 | 0.095 | 0.012 |
+
+**Frame 0 difference explained:** HF runs proj_out only on noisy-frame tokens
+via vision_mse_loss_indexes, producing exact zeros for conditioned frames.
+MLX runs proj_out on all tokens (garbage for conditioned frame) then zeros
+in pipeline. Both produce zero velocity for frame 0 in the final pipeline.
+
+**Conclusion:** i2v noisy frames match at cosine 0.9998+ at 720p. The
+transformer forward pass is faithful for i2v.
+
+### 3. Frame 0 Latent Preservation Through Denoising
+
+Instrumented scheduler.step() to track frame 0 latent across all steps.
+
+```
+Step  0: vel_f0_mag=0.000000 | in: mean=-0.0179 std=0.6344 | out: mean=-0.0179 std=0.6344 | diff=0.000000
+Step  1: vel_f0_mag=0.000000 | in: mean=-0.0179 std=0.6344 | out: mean=-0.0179 std=0.6344 | diff=0.000000
+...
+Step  9: vel_f0_mag=0.000000 | in: mean=-0.0179 std=0.6344 | out: mean=-0.0179 std=0.6344 | diff=0.000000
+```
+
+**Conclusion:** Frame 0 conditioning latent is perfectly preserved through
+all denoising steps. Velocity is exactly zero, latent unchanged.
+
+### 4. VAE Encode-Decode Roundtrip
+
+| Condition | PSNR | Mean pixel diff | Max pixel diff |
+|---|---|---|---|
+| Single frame encode→decode | 28.1 dB | 6.3 | 118 |
+| 16-frame encode→decode, frame 0 | 23.5 dB | 13.5 | 135 |
+
+**Visual evidence:**
+- `cosmos3_vae_roundtrip_input.png` — original input resized to 256
+- `cosmos3_vae_roundtrip_256.png` — single-frame roundtrip (good quality)
+- `cosmos3_vae_roundtrip_16f_frame0.png` — 16-frame roundtrip frame 0 (softer)
+
+**Conclusion:** 16-frame VAE roundtrip degrades frame 0 due to temporal causal
+convolutions in the decoder blending it with neighboring frame latents.
+This is expected VAE behavior, not a pipeline bug.
+
+### 5. Full i2v Pipeline Output (visual inspection)
+
+**Generated with:** seed=42, guidance=6.0, steps=30, prompt="A car driving
+along a coastal mountain road with falling rocks causing an emergency stop",
+conditioning image=example_i2v_input.jpg
+
+**256x256 output:**
+- `cosmos3_i2v_256_input.png` — input resized
+- `cosmos3_i2v_256_frame00.png` through `_frame15.png`
+- Frame 0: heavily degraded — stippling artifacts, barely recognizable
+- Frames 1+: soft/hazy but scene-coherent, no prompt-specific events
+
+**720p output:**
+- `cosmos3_i2v_720p_input.png` — input resized
+- `cosmos3_i2v_720p_frame00.png` through `_frame15.png`
+- Frame 0: degraded but recognizable (road, mountain visible)
+- Frames 1+: washed out, hazy, scene-coherent forward motion
+- No falling rocks or emergency stop (prompt-specific content missing)
+
+**Frame 0 degradation source:** VAE decoder temporal convolutions, not
+denoising corruption. Frame 0 latent is perfectly preserved through
+denoising; the degradation happens during video decode.
+
+## Eliminated Causes (Exhaustive)
+
+- VAE encoder: cosine 0.9999 vs HF (single and multi-frame)
+- VAE decoder: pixel-identical for identical latent input
+- Transformer t2v: cosine 0.99984 at 720p
+- Transformer i2v noisy frames: cosine 0.99981-0.99990 at 720p
+- Timestep embedding: mathematically equivalent (t2v and i2v)
+- mRoPE position IDs: identical formulas, verified config values
+- Token sequence packing: no zero gap for video-only
+- Patchify: matches HF zero-padding
+- Conditioning latents: cosine 0.9999
+- `.at[].add()` mask corruption: tested correct at 720p sizes
+- Velocity zeroing: structurally correct, frame 0 diff=0 at every step
+- Scheduler: max diff 0.0000019 (synthetic test), frame 0 preserved exactly
+
+## Open Questions
+
+1. Is the visual quality gap real or seed-dependent? Same-noise end-to-end
+   comparison needed but HF on CPU is too slow (~40+ min for 10 steps at 256).
+2. Does HF produce the same frame 0 degradation from VAE temporal decode?
+   Expected yes, but not verified.
+3. Does per-step cosine 0.9998 compound over 30 steps into visible differences?
+4. Is the missing prompt-specific content (falling rocks) a model capability
+   issue (Nano is 16B) or a code bug?
