@@ -339,9 +339,9 @@ def _count_encoder_cache_slots(weights: dict, config: dict) -> int:
             for _ in range(num_res_blocks):
                 # Each WanResidualBlock: conv1 + conv2 = 2 CausalConv3d
                 count += 2
-                # conv_shortcut only when in_dim != out_dim, and it's a 1x1 CausalConv3d
-                if in_dim != out_dim:
-                    count += 1
+                # conv_shortcut (1x1) exists when in_dim != out_dim but uses
+                # non-cached _conv3d_forward (kernel_size=1, no temporal context
+                # needed), so it does NOT consume a cache slot.
                 in_dim = out_dim
 
             # downsampler

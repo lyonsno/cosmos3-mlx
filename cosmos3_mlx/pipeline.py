@@ -291,8 +291,9 @@ class Cosmos3GenerationPipeline:
                 freely. Can be numpy array [H,W,3] (uint8 or float32) or PIL Image.
 
         Returns:
-            dict with 'latents', 'video' (if VAE available),
-            'audio_latents' (if enable_audio), 'audio' (if audio decoded)
+            dict with 'latents' (normalized, use decode_latents() to decode),
+            'video' (if VAE available), 'audio_latents' (if enable_audio),
+            'audio' (if audio decoded)
         """
         if seed is not None:
             mx.random.seed(seed)

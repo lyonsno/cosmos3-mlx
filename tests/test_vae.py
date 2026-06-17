@@ -9,10 +9,12 @@ from cosmos3_mlx.decode_vae import (
     _conv3d_forward, _transpose_conv3d_weight, decode_latents,
 )
 from cosmos3_mlx.encode_vae import (
+    _avg_down_3d,
     _conv3d_forward_cached,
-    _encoder_forward,
     _count_encoder_cache_slots,
+    _encoder_forward,
     _patchify_input,
+    _resnet_block_cached,
     CACHE_T,
 )
 
@@ -314,7 +316,126 @@ class TestCountEncoderCacheSlots:
             "base_dim": 160,
         }
         count = _count_encoder_cache_slots({}, config)
-        # conv_in(1) + 4 blocks × resnets + shortcuts + time_convs + mid(4) + conv_out(1)
-        # Must be positive and reasonable
-        assert count > 10
-        assert count < 50
+        # conv_in(1) + block0(4) + block1(4+1) + block2(4+1) + block3(4) + mid(4) + conv_out(1) = 24
+        assert count == 24
+
+
+class TestResnetBlockCachedAlignment:
+    """Test that _resnet_block_cached consumes the correct number of cache slots."""
+
+    def test_cache_slots_consumed_matches_count(self):
+        """A resnet block with conv_shortcut should consume exactly 2 slots (conv1 + conv2)."""
+        mx.random.seed(42)
+        in_c, out_c = 8, 16
+        prefix = "block"
+        weights = {
+            f"{prefix}.norm1.gamma": mx.ones((in_c,)),
+            f"{prefix}.conv1.weight": mx.random.normal((out_c, 3, 3, 3, in_c)) * 0.01,
+            f"{prefix}.conv1.bias": mx.zeros((out_c,)),
+            f"{prefix}.norm2.gamma": mx.ones((out_c,)),
+            f"{prefix}.conv2.weight": mx.random.normal((out_c, 3, 3, 3, out_c)) * 0.01,
+            f"{prefix}.conv2.bias": mx.zeros((out_c,)),
+            f"{prefix}.conv_shortcut.weight": mx.random.normal((out_c, 1, 1, 1, in_c)) * 0.01,
+            f"{prefix}.conv_shortcut.bias": mx.zeros((out_c,)),
+        }
+        mx.eval(*weights.values())
+
+        x = mx.random.normal((1, 1, 4, 4, in_c))
+        mx.eval(x)
+
+        # 2 slots: conv1 + conv2. conv_shortcut does NOT use a slot.
+        feat_cache = [None, None]
+        feat_idx = [0]
+        out = _resnet_block_cached(x, weights, prefix, feat_cache, feat_idx)
+        mx.eval(out)
+
+        assert feat_idx[0] == 2, f"Expected 2 slots consumed, got {feat_idx[0]}"
+        assert out.shape == (1, 1, 4, 4, out_c)
+
+    def test_same_channels_no_shortcut(self):
+        """A resnet block without conv_shortcut should also consume exactly 2 slots."""
+        mx.random.seed(42)
+        c = 8
+        prefix = "block"
+        weights = {
+            f"{prefix}.norm1.gamma": mx.ones((c,)),
+            f"{prefix}.conv1.weight": mx.random.normal((c, 3, 3, 3, c)) * 0.01,
+            f"{prefix}.conv1.bias": mx.zeros((c,)),
+            f"{prefix}.norm2.gamma": mx.ones((c,)),
+            f"{prefix}.conv2.weight": mx.random.normal((c, 3, 3, 3, c)) * 0.01,
+            f"{prefix}.conv2.bias": mx.zeros((c,)),
+        }
+        mx.eval(*weights.values())
+
+        x = mx.random.normal((1, 1, 4, 4, c))
+        mx.eval(x)
+
+        feat_cache = [None, None]
+        feat_idx = [0]
+        out = _resnet_block_cached(x, weights, prefix, feat_cache, feat_idx)
+        mx.eval(out)
+
+        assert feat_idx[0] == 2
+        assert out.shape == (1, 1, 4, 4, c)
+
+
+class TestPatchifyInput:
+    """Test spatial patchification for encoder input."""
+
+    def test_output_shape(self):
+        """Patchify should pack spatial patches into channels."""
+        x = mx.random.normal((1, 2, 8, 8, 3))
+        out = _patchify_input(x, patch_size=2)
+        # [1, 2, 8, 8, 3] -> [1, 2, 4, 4, 3*2*2] = [1, 2, 4, 4, 12]
+        assert out.shape == (1, 2, 4, 4, 12)
+
+    def test_known_values(self):
+        """Verify patch ordering matches HF convention."""
+        # 1x1x4x4x1 input with distinct values
+        x = mx.arange(16, dtype=mx.float32).reshape(1, 1, 4, 4, 1)
+        out = _patchify_input(x, patch_size=2)
+        mx.eval(out)
+        # Shape: [1, 1, 2, 2, 4]
+        assert out.shape == (1, 1, 2, 2, 4)
+        # Top-left 2x2 patch: values 0,1,4,5
+        # HF convention: [B,T,H//p,W//p,C,p_w,p_h] so patch = C * p_w * p_h
+        patch_00 = out[0, 0, 0, 0].tolist()
+        # The 4 values in patch (0,0) should be the 2x2 block at rows 0-1, cols 0-1
+        assert set(patch_00) == {0.0, 1.0, 4.0, 5.0}
+
+
+class TestAvgDown3D:
+    """Test parameter-free channel-reshaping average-pool shortcut."""
+
+    def test_spatial_only(self):
+        """Spatial-only downsampling (factor_t=1, factor_s=2)."""
+        x = mx.ones((1, 2, 4, 4, 8))
+        out = _avg_down_3d(x, in_channels=8, out_channels=32, factor_t=1, factor_s=2)
+        mx.eval(out)
+        assert out.shape == (1, 2, 2, 2, 32)
+
+    def test_spatiotemporal(self):
+        """Spatiotemporal downsampling (factor_t=2, factor_s=2)."""
+        x = mx.ones((1, 4, 8, 8, 8))
+        out = _avg_down_3d(x, in_channels=8, out_channels=64, factor_t=2, factor_s=2)
+        mx.eval(out)
+        assert out.shape == (1, 2, 4, 4, 64)
+
+    def test_no_downsampling(self):
+        """No downsampling (factor_t=1, factor_s=1), just channel change."""
+        x = mx.ones((1, 2, 4, 4, 8))
+        out = _avg_down_3d(x, in_channels=8, out_channels=8, factor_t=1, factor_s=1)
+        mx.eval(out)
+        assert out.shape == (1, 2, 4, 4, 8)
+        # All ones in, averaged groups of 1 → all ones out
+        assert mx.allclose(out, mx.ones_like(out)).item()
+
+    def test_averaging(self):
+        """Verify values are actually averaged, not just reshuffled."""
+        mx.random.seed(42)
+        x = mx.random.normal((1, 2, 4, 4, 4))
+        mx.eval(x)
+        out = _avg_down_3d(x, in_channels=4, out_channels=8, factor_t=1, factor_s=2)
+        mx.eval(out)
+        # factor=1*2*2=4, group_size=4*4/8=2. Each output channel averages 2 values.
+        assert out.shape == (1, 2, 2, 2, 8)
