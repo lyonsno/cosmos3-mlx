@@ -155,3 +155,29 @@ at all resolutions in a prior session. This is consistent with the double
 denormalization being the sole cause — both t2v and i2v were affected, but
 only i2v has a ground-truth conditioning frame that makes the corruption
 immediately visible.
+
+## Remaining: Early-Frame Quality (post-fix)
+
+After the double-denorm fix, the first 3-4 pixel frames (latent frame 0 =
+conditioned, decoded into pixel frames 0-3) are still slightly hazy and more
+static than frames 4+. The NVIDIA reference `example_i2v_output.mp4` does NOT
+show this — early frames are crisp and in motion from frame 1.
+
+**Latent statistics show a sharp discontinuity at the conditioning boundary:**
+```
+frame 0 (cond):  std=0.626  range [-3.0, 3.0]
+frame 1 (gen):   std=0.869  range [-4.2, 3.6]
+frame 2 (gen):   std=0.947  range [-4.4, 4.1]
+frame 3 (gen):   std=0.953  range [-4.3, 4.4]
+cos(f0, f1) = 0.68  (big jump)
+cos(f1, f2) = 0.85  (smooth)
+cos(f2, f3) = 0.86  (smooth)
+```
+
+The conditioning latent (frame 0) has much lower variance than generated
+frames. The VAE decoder's temporal convolutions cross this boundary, causing
+visible quality degradation in the early decoded frames.
+
+**Not yet determined:** whether HF produces the same latent statistics at
+the boundary, or whether their conditioning/mixing approach avoids this
+discontinuity. The reference output proves clean early frames are possible.
