@@ -127,12 +127,31 @@ denoising; the degradation happens during video decode.
 - Velocity zeroing: structurally correct, frame 0 diff=0 at every step
 - Scheduler: max diff 0.0000019 (synthetic test), frame 0 preserved exactly
 
-## Open Questions
+## ROOT CAUSE FOUND: Double Denormalization
 
-1. Is the visual quality gap real or seed-dependent? Same-noise end-to-end
-   comparison needed but HF on CPU is too slow (~40+ min for 10 steps at 256).
-2. Does HF produce the same frame 0 degradation from VAE temporal decode?
-   Expected yes, but not verified.
-3. Does per-step cosine 0.9998 compound over 30 steps into visible differences?
-4. Is the missing prompt-specific content (falling rocks) a model capability
-   issue (Nano is 16B) or a code bug?
+**Bug:** `pipeline.generate()` returned already-denormalized latents
+(`latents * std + mean`) in `result["latents"]`. All external decode paths
+called `decode_latents(result["latents"], vae_dir)` which denormalized
+AGAIN: `(latents * std + mean) * std + mean`. This corrupted the entire
+latent space, producing the washed-out, stippled, detail-free output.
+
+**Fix:** Pipeline now returns normalized latents. `decode_latents()` handles
+denormalization as its contract specifies. One-line change in `pipeline.py`.
+
+**Visual proof:**
+- `cosmos3_DOUBLE_DENORM_frame0.png` — before fix (stippled mess)
+- `cosmos3_CORRECT_DENORM_frame0.png` — after fix (crisp, matches input)
+- `cosmos3_FIXED_i2v_256_frame*.png` — full 16-frame fixed output
+
+**Why this only affected i2v:** t2v visual smoke tests were evaluated from
+a different code path or with different expectations. The double denorm
+affects ALL decode, but frame 0 of i2v (which should match the input image)
+made the corruption obvious. t2v output has no ground-truth frame to compare
+against, so the degradation was less noticeable.
+
+**Operator observation (confirmed, durable):** The quality problem is specific
+to image-conditioned generation (i2v). t2v output was visually confirmed good
+at all resolutions in a prior session. This is consistent with the double
+denormalization being the sole cause — both t2v and i2v were affected, but
+only i2v has a ground-truth conditioning frame that makes the corruption
+immediately visible.

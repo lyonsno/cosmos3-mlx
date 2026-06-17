@@ -546,15 +546,14 @@ class Cosmos3GenerationPipeline:
             if (i + 1) % 10 == 0 or i == 0:
                 print(f"  Step {i+1}/{num_inference_steps} (σ={sigma:.4f})")
 
-        # 5. Denormalize latents and decode
-        # The model operates in normalized latent space: z_norm = (z - mean) / std
-        # Reverse: z = z_norm * std + mean
-        # Latents are channels-last [B, T, H, W, z_dim]; mean/std broadcast on last dim
+        # 5. Return normalized latents; denormalize only for internal VAE decode.
+        # External callers use decode_latents() which handles denormalization.
+        result = {"latents": latents}
+
+        # Denormalize for internal VAE decoder path
         std = self._latents_std.astype(latents.dtype)
         mean = self._latents_mean.astype(latents.dtype)
         latents_denorm = latents * std + mean
-
-        result = {"latents": latents_denorm}
 
         if self.vae_decoder is not None:
             print("  Decoding video...")
