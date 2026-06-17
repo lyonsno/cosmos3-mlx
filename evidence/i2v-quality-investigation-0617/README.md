@@ -180,4 +180,16 @@ visible quality degradation in the early decoded frames.
 
 **Not yet determined:** whether HF produces the same latent statistics at
 the boundary, or whether their conditioning/mixing approach avoids this
-discontinuity. The reference output proves clean early frames are possible.
+discontinuity. The NVIDIA reference output proves clean early frames are
+possible with this model.
+
+**Tested and eliminated:**
+- Step count (30 vs 35): no visible difference at 256
+- KV caching vs full recompute: architecturally correct (und pathway is
+  causal self-attention only, doesn't attend to gen tokens)
+
+**Remaining suspects:**
+- fps=25 vs HF's fps=24 (affects mRoPE temporal positions and text prompt)
+- NVIDIA reference may use cosmos-framework, not diffusers pipeline
+- The reference uses a vastly more detailed structured prompt
+- Need HF pipeline on GPU to properly baseline early-frame quality
