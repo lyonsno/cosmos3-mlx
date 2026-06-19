@@ -594,7 +594,7 @@ def encode_video(
         out = _encoder_forward(x[:, :1], weights, config, feat_cache, feat_idx)
 
         # Subsequent chunks: 4 frames at a time
-        num_iter = 1 + (num_frames - 1) // 4
+        num_iter = 1 + (num_frames - 1 + 3) // 4  # ceil division: process all frames
         for i in range(1, num_iter):
             feat_idx[0] = 0
             start = 1 + 4 * (i - 1)

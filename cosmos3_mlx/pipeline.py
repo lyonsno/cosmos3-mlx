@@ -95,7 +95,7 @@ class Cosmos3GenerationPipeline:
         # but the model may have been trained with a larger separation.
         temporal_margin = 15000
         temporal_offset = float(text_len + temporal_margin)
-        fps = 25.0
+        fps = 24.0
         video_tcf = 4
         base_fps = 24.0
         tps = fps / video_tcf
@@ -313,7 +313,7 @@ class Cosmos3GenerationPipeline:
         if is_image:
             user_content = prompt + f" This image is of {height}x{width} resolution."
         else:
-            fps = 25
+            fps = 24
             duration = num_frames / fps
             user_content = (prompt
                 + f" The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
@@ -396,10 +396,12 @@ class Cosmos3GenerationPipeline:
         # 2b. Prepare audio noise latents if enabled
         sound_latents = None
         sound_len = 0
+        if enable_audio and num_frames <= 1:
+            print("  Warning: --enable-audio ignored for single-frame generation")
         if enable_audio and num_frames > 1:
             sound_dim = 64  # Cosmos3 audio latent dim
             sampling_rate = 48000
-            fps = 25
+            fps = 24
             hop_size = 1920
             n_audio_samples = int(num_frames / fps * sampling_rate)
             sound_len = (n_audio_samples + hop_size - 1) // hop_size
@@ -575,7 +577,7 @@ class Cosmos3GenerationPipeline:
 def save_video(
     video_frames: np.ndarray,
     output_path: str,
-    fps: int = 25,
+    fps: int = 24,
     audio_waveform: np.ndarray = None,
     audio_sample_rate: int = 48000,
 ) -> str:
@@ -591,8 +593,18 @@ def save_video(
     Returns:
         output path
     """
+    import shutil
+
     output_path = str(output_path)
     is_mp4 = output_path.endswith(".mp4")
+
+    if is_mp4 and shutil.which("ffmpeg") is None:
+        if audio_waveform is not None:
+            print("Warning: ffmpeg not found. Audio will be dropped. Saving as GIF.")
+        else:
+            print("Warning: ffmpeg not found. Saving as GIF instead.")
+        output_path = output_path.rsplit(".", 1)[0] + ".gif"
+        is_mp4 = False
 
     if is_mp4 and audio_waveform is not None:
         # Write frames as PNG sequence + WAV, mux with ffmpeg

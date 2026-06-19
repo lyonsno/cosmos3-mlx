@@ -52,7 +52,6 @@ if __name__ == "__main__":
         help="Negative prompt (default: model's built-in negative prompt)",
     )
     parser.add_argument("--output", default="out.mp4")
-    parser.add_argument("--fps", type=int, default=25, help="Output video FPS")
     parser.add_argument("--enable-audio", action="store_true", help="Generate audio")
     parser.add_argument(
         "--no-cache",
@@ -63,6 +62,18 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     width, height = args.size
+
+    if args.frames < 8 or args.frames % 4 != 0:
+        parser.error("--frames must be a multiple of 4 and >= 8 (e.g., 8, 16, 32)")
+    if width % 16 != 0 or height % 16 != 0:
+        parser.error(f"--size dimensions must be multiples of 16 (got {width}x{height})")
+
+    # Preflight: check required assets before expensive model load
+    vae_dir = Path(args.model_dir) / "vae"
+    if not (vae_dir / "config.json").exists():
+        parser.error(f"VAE weights not found at {vae_dir}. Download the full model first.")
+    if args.enable_audio and not (Path(args.model_dir) / "sound_tokenizer" / "config.json").exists():
+        parser.error(f"Sound tokenizer not found. Download the full model or disable --enable-audio.")
 
     mx.set_default_device(mx.gpu)
     if args.no_cache:
@@ -110,8 +121,9 @@ if __name__ == "__main__":
     del pipeline
     mx.clear_cache()
 
-    peak_mem_generation = mx.get_peak_memory() / 1024**3
-    mx.reset_peak_memory()
+    if args.verbose and hasattr(mx, "get_peak_memory"):
+        peak_mem_generation = mx.get_peak_memory() / 1024**3
+        mx.reset_peak_memory()
 
     # Decode video
     vae_dir = str(Path(args.model_dir) / "vae")
@@ -119,8 +131,6 @@ if __name__ == "__main__":
     mx.eval(video)
     video_np = np.array(video[0].astype(mx.float32))
     video_np = (video_np * 255).clip(0, 255).astype(np.uint8)
-
-    peak_mem_decoding = mx.get_peak_memory() / 1024**3
 
     # Decode audio if generated
     audio_np = None
@@ -133,9 +143,10 @@ if __name__ == "__main__":
         audio_np = np.array(audio_waveform[0].astype(mx.float32))
 
     # Save
-    save_video(video_np, args.output, fps=args.fps, audio_waveform=audio_np)
-    print(f"\nSaved to {args.output} ({t_gen:.1f}s generation)")
+    saved_path = save_video(video_np, args.output, fps=24, audio_waveform=audio_np)
+    print(f"\nSaved to {saved_path} ({t_gen:.1f}s generation)")
 
-    if args.verbose:
+    if args.verbose and hasattr(mx, "get_peak_memory"):
+        peak_mem_decoding = mx.get_peak_memory() / 1024**3
         print(f"Peak memory generation: {peak_mem_generation:.3f}GB")
         print(f"Peak memory decoding:   {peak_mem_decoding:.3f}GB")

@@ -22,6 +22,11 @@ from .vision import VisionConfig, VisionModel
 def load_transformer_config(model_dir: str | Path) -> Cosmos3Config:
     """Load transformer config from HuggingFace model directory."""
     config_path = Path(model_dir) / "transformer" / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Model config not found at {config_path}. "
+            f"Download the model first: hf download nvidia/Cosmos3-Nano --local-dir {model_dir}"
+        )
     with open(config_path) as f:
         cfg = json.load(f)
 
@@ -73,7 +78,7 @@ def _load_safetensors_shards(directory: Path) -> dict[str, mx.array]:
 
 def load_transformer(
     model_dir: str | Path,
-    reasoner_only: bool = True,
+    reasoner_only: bool = False,
     dtype: mx.Dtype = mx.bfloat16,
 ) -> Cosmos3Model:
     """Load Cosmos 3 transformer with weights.
@@ -99,9 +104,17 @@ def load_transformer(
     # Cast to target dtype
     weights = {k: v.astype(dtype) for k, v in weights.items()}
 
-    # Load into model (strict=False to skip weights not in model,
-    # e.g. action_proj_in.fc which uses a non-standard structure)
+    # Load into model (strict=False: action_proj_in.fc uses a non-standard
+    # structure that doesn't map to the nn.Module tree)
+    model_params = set(k for k, _ in mx.utils.tree_flatten(model.parameters()))
+    weight_keys = set(weights.keys())
+    skipped = weight_keys - model_params
+    missing = model_params - weight_keys
     model.load_weights(list(weights.items()), strict=False)
+    if skipped:
+        print(f"  Skipped {len(skipped)} weight keys not in model")
+    if missing:
+        print(f"  Warning: {len(missing)} model parameters not found in weights")
 
     return model
 

@@ -407,8 +407,8 @@ class Cosmos3Model(nn.Module):
         temporal_margin = 15000
         temporal_offset = float(text_len + temporal_margin)
 
-        # Video FPS modulation: fps=25, temporal_compression_factor=4, base_fps=24
-        fps = 25.0
+        # Video FPS modulation: fps=24, temporal_compression_factor=4, base_fps=24
+        fps = 24.0
         video_tcf = 4  # temporal compression factor for video VAE
         base_fps = 24.0
         tps = fps / video_tcf  # 6.25 tokens per second
@@ -435,7 +435,7 @@ class Cosmos3Model(nn.Module):
             audio_h = audio_h + mx.expand_dims(t_emb, 1)
 
             # Audio mRoPE: temporal siblings with video, grid_h=1, grid_w=1
-            # Audio: temporal_compression_factor=1, so tps = fps/1 = 25
+            # Audio: temporal_compression_factor=1, so tps = fps/1 = 24
             # base_tps for audio uses the audio compression factor (1), not video's (4)
             audio_tps = fps / 1.0  # 25 tokens per second
             audio_base_tps = base_fps / 1.0  # 24.0 (base_fps / audio_tcf)
