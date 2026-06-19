@@ -274,6 +274,7 @@ class Cosmos3GenerationPipeline:
         seed: Optional[int] = None,
         enable_audio: bool = False,
         image: Optional[Union[np.ndarray, "PILImage"]] = None,
+        negative_prompt: Optional[str] = None,
     ) -> dict:
         """Generate image/video from text prompt, optionally conditioned on an image.
 
@@ -289,6 +290,8 @@ class Cosmos3GenerationPipeline:
             image: optional conditioning image for i2v. When provided, frame 0
                 is anchored to this image and the remaining frames are denoised
                 freely. Can be numpy array [H,W,3] (uint8 or float32) or PIL Image.
+            negative_prompt: optional negative prompt text. If None, uses the
+                model's built-in negative prompt from assets/negative_prompt.json.
 
         Returns:
             dict with 'latents' (normalized, use decode_latents() to decode),
@@ -331,8 +334,7 @@ class Cosmos3GenerationPipeline:
         cond_ids = mx.array([tokens])
 
         # Unconditional prompt for CFG
-        # Use reference negative prompt if available, otherwise empty string
-        neg_prompt = self._negative_prompt_text or ""
+        neg_prompt = negative_prompt if negative_prompt is not None else (self._negative_prompt_text or "")
         if is_image:
             neg_suffix = f" This image is not of {height}x{width} resolution."
         else:

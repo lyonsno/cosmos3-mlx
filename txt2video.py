@@ -46,6 +46,11 @@ if __name__ == "__main__":
         metavar="{4,8}",
         help="Quantize model weights (default: 8-bit when flag used without value)",
     )
+    parser.add_argument(
+        "--n-prompt",
+        default=None,
+        help="Negative prompt (default: model's built-in negative prompt)",
+    )
     parser.add_argument("--output", default="out.mp4")
     parser.add_argument("--fps", type=int, default=25, help="Output video FPS")
     parser.add_argument("--enable-audio", action="store_true", help="Generate audio")
@@ -70,7 +75,7 @@ if __name__ == "__main__":
     tokenizer = load_tokenizer(args.model_dir)
 
     if args.quantize:
-        nn.quantize(model, bits=args.quantize, group_size=64)
+        nn.quantize(model, bits=args.quantize)
         mx.eval(model.parameters())
         print(f"Quantized to {args.quantize}-bit")
 
@@ -96,6 +101,7 @@ if __name__ == "__main__":
         guidance_scale=args.guidance,
         seed=args.seed,
         enable_audio=args.enable_audio,
+        negative_prompt=args.n_prompt,
     )
     t_gen = time.time() - t_start
 
