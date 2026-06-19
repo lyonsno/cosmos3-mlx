@@ -1,0 +1,5 @@
+mlx>=0.24.0
+numpy
+Pillow
+transformers
+huggingface_hub
