@@ -104,17 +104,26 @@ def load_transformer(
     # Cast to target dtype
     weights = {k: v.astype(dtype) for k, v in weights.items()}
 
-    # Load into model (strict=False: action_proj_in.fc uses a non-standard
-    # structure that doesn't map to the nn.Module tree)
+    # Weight keys that are in the checkpoint but have no matching nn.Module
+    # parameter (action modality projections use a non-standard structure)
+    EXPECTED_EXTRA_KEYS = {"action_proj_in.fc.weight", "action_proj_out.weight"}
+
     model_params = set(k for k, _ in mx.utils.tree_flatten(model.parameters()))
     weight_keys = set(weights.keys())
     skipped = weight_keys - model_params
     missing = model_params - weight_keys
+    unexpected_extra = skipped - EXPECTED_EXTRA_KEYS
+
     model.load_weights(list(weights.items()), strict=False)
-    if skipped:
-        print(f"  Skipped {len(skipped)} weight keys not in model")
+
+    if unexpected_extra:
+        print(f"  Note: {len(unexpected_extra)} unexpected extra weight keys")
     if missing:
-        print(f"  Warning: {len(missing)} model parameters not found in weights")
+        raise RuntimeError(
+            f"Missing {len(missing)} required model parameters in weights. "
+            f"First 5: {sorted(missing)[:5]}. "
+            f"The checkpoint may be incomplete or from an incompatible model version."
+        )
 
     return model
 
