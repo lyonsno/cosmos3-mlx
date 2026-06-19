@@ -334,19 +334,15 @@ def decode_latents(
     # Track input temporal dimension for T=1 vs T>1 behavior differences
     input_t = z.shape[1]
 
-    print(f"    Denormalized latent stats: mean={mx.mean(z).item():.3f}, std={mx.std(z).item():.3f}")
-
     # post_quant_conv: 1x1x1 Conv3D that transforms latent channels before decoder
     if pqc_weight is not None:
         z = _conv3d_forward(z, pqc_weight, pqc_bias,
                             stride=(1, 1, 1), padding=(0, 0, 0), causal=False)
         mx.eval(z)
-        print(f"    After post_quant_conv: mean={mx.mean(z).item():.3f}, std={mx.std(z).item():.3f}")
 
     # conv_in
     x = _conv3d_forward(z, weights["conv_in.weight"], weights.get("conv_in.bias"))
     mx.eval(x)
-    print(f"    After conv_in: {x.shape}")
 
     # mid_block: resnet[0] -> attention[0] -> resnet[1]
     x = _resnet_block(x, weights, "mid_block.resnets.0")
@@ -360,7 +356,6 @@ def decode_latents(
 
     x = _resnet_block(x, weights, "mid_block.resnets.1")
     mx.eval(x)
-    print(f"    After mid_block: {x.shape}")
 
     # up_blocks (WanResidualUpBlock)
     temporal_upsample = list(reversed(config.get("temperal_downsample", [False, True, True])))
@@ -425,14 +420,11 @@ def decode_latents(
             x = x + shortcut
             mx.eval(x)
 
-        print(f"    After up_block {block_idx}: {x.shape}")
-
     # norm_out + silu + conv_out
     x = _rms_norm(x, weights["norm_out.gamma"])
     x = nn.silu(x)
     x = _conv3d_forward(x, weights["conv_out.weight"], weights.get("conv_out.bias"))
     mx.eval(x)
-    print(f"    After conv_out: {x.shape}")
 
     # Unpatchify if needed (patch_size=2)
     # HF packs channels as [C, p1, p2] and interleaves H with p2, W with p1.
@@ -445,7 +437,6 @@ def decode_latents(
         x = x.reshape(b, t, h, w, c, patch_size, patch_size)
         x = mx.transpose(x, (0, 1, 2, 6, 3, 5, 4))  # [B, T, H, p2, W, p1, C]
         x = x.reshape(b, t, h * patch_size, w * patch_size, c)
-        print(f"    After unpatchify: {x.shape}")
 
     # Clamp to [0, 1]
     x = (mx.clip(x, -1.0, 1.0) + 1.0) / 2.0

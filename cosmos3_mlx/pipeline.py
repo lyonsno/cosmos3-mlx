@@ -379,8 +379,6 @@ class Cosmos3GenerationPipeline:
             # Crop to match noise latent temporal/spatial dims
             cond_latents = cond_latents[:, :t_lat, :h_lat, :w_lat, :]
             mx.eval(cond_latents)
-            print(f"  Condition latents: {cond_latents.shape}, "
-                  f"mean={mx.mean(cond_latents).item():.3f}, std={mx.std(cond_latents).item():.3f}")
 
             # Frame 0 is conditioned
             vision_condition_mask = vision_condition_mask.at[0, 0, 0].add(mx.array(1.0))

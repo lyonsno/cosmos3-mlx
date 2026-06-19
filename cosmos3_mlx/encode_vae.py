@@ -577,8 +577,6 @@ def encode_video(
     patch_size = config.get("patch_size", 2)
     if patch_size is not None and patch_size > 1:
         x = _patchify_input(x, patch_size)
-    print(f"    After patchify: {x.shape}")
-
     if num_frames == 1:
         # Single frame: no chunking needed, no feat_cache overhead
         out = _encoder_forward(x, weights, config)
@@ -594,7 +592,6 @@ def encode_video(
         # Chunk 0: first frame
         feat_idx[0] = 0
         out = _encoder_forward(x[:, :1], weights, config, feat_cache, feat_idx)
-        print(f"    Chunk 0 (frame 0): out shape {out.shape}")
 
         # Subsequent chunks: 4 frames at a time
         num_iter = 1 + (num_frames - 1) // 4
@@ -606,9 +603,6 @@ def encode_video(
             chunk_out = _encoder_forward(chunk, weights, config, feat_cache, feat_idx)
             out = mx.concatenate([out, chunk_out], axis=1)
             mx.eval(out)
-            print(f"    Chunk {i} (frames {start}:{end}): out shape {chunk_out.shape}, total {out.shape}")
-
-    print(f"    Encoder output: {out.shape}")
 
     # quant_conv
     if qc_weight is not None:
@@ -619,7 +613,6 @@ def encode_video(
     # Extract mean (argmax mode): first z_dim channels
     z_dim = config.get("z_dim", 48)
     mu = out[..., :z_dim]
-    print(f"    Raw latent mu: mean={mx.mean(mu).item():.3f}, std={mx.std(mu).item():.3f}")
 
     # Normalize: z_norm = (mu - mean) * inv_std
     latents_mean = config.get("latents_mean", [0.0] * z_dim)
@@ -627,7 +620,6 @@ def encode_video(
     mean = mx.array(latents_mean, dtype=mu.dtype)
     inv_std = 1.0 / mx.array(latents_std, dtype=mu.dtype)
     z_norm = (mu - mean) * inv_std
-    print(f"    Normalized latent: mean={mx.mean(z_norm).item():.3f}, std={mx.std(z_norm).item():.3f}")
 
     return z_norm
 

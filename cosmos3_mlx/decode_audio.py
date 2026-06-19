@@ -134,13 +134,11 @@ def decode_audio(
     strides = config.get("dec_strides", [2, 4, 5, 6, 8])
 
     x = audio_latents.astype(mx.float32)
-    print(f"    Audio input: {x.shape}, mean={mx.mean(x).item():.3f}, std={mx.std(x).item():.3f}")
 
     # conv1: Conv1d(64, 5120, 7, padding=3) with weight norm
     x = _weight_norm_conv1d(x, weights["conv1.weight_v"], weights["conv1.weight_g"],
                             weights.get("conv1.bias"), padding=3)
     mx.eval(x)
-    print(f"    After conv1: {x.shape}")
 
     # Decoder blocks (5 blocks, strides reversed = [8, 6, 5, 4, 2])
     for block_idx in range(5):
@@ -207,7 +205,6 @@ def decode_audio(
             x = x + residual
 
         mx.eval(x)
-        print(f"    After block {block_idx} (stride={stride}): {x.shape}")
 
     # Final: snake1 + conv2 (output conv)
     x = _snake_beta(x, weights["snake1.alpha"], weights["snake1.beta"], log_scale)
@@ -215,7 +212,6 @@ def decode_audio(
     x = _weight_norm_conv1d(x, weights["conv2.weight_v"], weights["conv2.weight_g"],
                             weights.get("conv2.bias"), padding=3)
     mx.eval(x)
-    print(f"    After conv_out: {x.shape}")
 
     x = mx.clip(x, -1.0, 1.0)
     return x
