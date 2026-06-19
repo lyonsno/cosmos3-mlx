@@ -44,9 +44,9 @@ if __name__ == "__main__":
         nargs="?",
         const=8,
         default=0,
-        choices=[0, 4, 8],
-        metavar="{4,8}",
-        help="Quantize model weights (default: 8-bit when flag used without value)",
+        choices=[0, 8],
+        metavar="{8}",
+        help="Quantize model weights to 8-bit (default when flag used without value)",
     )
     parser.add_argument(
         "--n-prompt",

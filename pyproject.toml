@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 dependencies = [
-    "mlx>=0.24.0",
+    "mlx>=0.31.0",
     "numpy",
     "safetensors",
     "huggingface-hub",
