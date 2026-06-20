@@ -13,6 +13,7 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 
 from .convert import convert_weights
 from .model import Cosmos3Config, Cosmos3Model
@@ -108,7 +109,7 @@ def load_transformer(
     # parameter (action modality projections use a non-standard structure)
     EXPECTED_EXTRA_KEYS = {"action_proj_in.fc.weight", "action_proj_out.weight"}
 
-    model_params = set(k for k, _ in mx.utils.tree_flatten(model.parameters()))
+    model_params = set(k for k, _ in tree_flatten(model.parameters()))
     weight_keys = set(weights.keys())
     skipped = weight_keys - model_params
     missing = model_params - weight_keys
